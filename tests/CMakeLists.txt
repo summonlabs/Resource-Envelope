@@ -22,7 +22,9 @@ set(RESOURCE_ENVELOPE_TEST_SOURCES
   core/test_time.cpp
   eval/test_evaluate.cpp
   integration/test_service_store.cpp
-  adversarial/test_hostile_inputs.cpp)
+  adversarial/test_hostile_inputs.cpp
+  property/test_canonical_invariants.cpp
+  recovery/test_crash_recovery.cpp)
 
 foreach(source ${RESOURCE_ENVELOPE_TEST_SOURCES})
   get_filename_component(name ${source} NAME_WE)

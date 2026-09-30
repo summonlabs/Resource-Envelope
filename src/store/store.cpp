@@ -323,6 +323,9 @@ Status apply_journal_entry(StoreState& state, const JournalEntry& entry, std::ui
       record.stored_sequence = entry.sequence;
       record.envelope = envelope;
       target.current_revision_key = envelope.id + "@" + std::to_string(envelope.revision);
+      if (!entry.declaration->idempotency_key.empty()) {
+        target.revision_keys[entry.declaration->idempotency_key] = envelope.revision;
+      }
       target.revisions.push_back(std::move(record));
       ++state.revision_count;
       return Status{};
@@ -354,6 +357,9 @@ Status apply_journal_entry(StoreState& state, const JournalEntry& entry, std::ui
       record.stored_sequence = entry.sequence;
       record.envelope = envelope;
       found->second.current_revision_key = envelope.id + "@" + std::to_string(envelope.revision);
+      if (!entry.revision->idempotency_key.empty()) {
+        found->second.revision_keys[entry.revision->idempotency_key] = envelope.revision;
+      }
       found->second.revisions.push_back(std::move(record));
       ++state.revision_count;
       while (found->second.revisions.size() > kMaxRetainedRevisionsPerEnvelope) {
@@ -450,6 +456,11 @@ Bytes canonical_store_state(const StoreState& state) {
       writer.bool_value(record.current);
       writer.u64(record.stored_sequence);
     }
+    writer.u32(static_cast<std::uint32_t>(pair.second.revision_keys.size()));
+    for (const auto& key : pair.second.revision_keys) {
+      writer.text(key.first);
+      writer.u64(key.second);
+    }
   }
   writer.u32(static_cast<std::uint32_t>(state.decisions.size()));
   for (const DecisionRecord& record : state.decisions) writer.blob(canonical_decision_record(record));
@@ -484,16 +495,37 @@ Bytes canonical_store_state(const StoreState& state) {
 }
 
 Digest store_state_digest(const StoreState& state) noexcept {
-  // The digest covers the effective state only. Folding the journal in would make the
-  // digest depend on how a state was reached, so two states that a reader cannot tell
-  // apart would compare unequal.
+  // The digest covers the effective envelope state only. The journal and the compaction
+  // counter are store bookkeeping: folding either in would make the digest depend on how a
+  // state was reached, so two states a reader cannot tell apart would compare unequal, and an
+  // unrelated compaction would change the commitment to constraints that did not change.
   StoreState effective = state;
   effective.journal.clear();
+  effective.compaction_count = 0U;
   const Bytes body = canonical_store_state(effective);
   return Digest(sha256_domain(kDomainState, std::span<const std::uint8_t>(body.data(), body.size())));
 }
 
 namespace {
+
+// The snapshot's own metadata block. It is recorded beside the state so that the counters a
+// snapshot reports can be cross-checked against the state it carries, and so that a future
+// reader can trust the snapshot alone.
+struct SnapshotMetadata {
+  std::uint64_t snapshot_epoch = 0;
+  std::uint64_t source_epoch = 0;
+  std::uint64_t envelope_count = 0;
+  std::uint64_t revision_count = 0;
+  std::uint64_t decision_count = 0;
+  std::uint64_t usage_entry_count = 0;
+  std::uint64_t observation_count = 0;
+  std::uint64_t compaction_count = 0;
+};
+
+struct DecodedSnapshot {
+  StoreState state;
+  SnapshotMetadata metadata;
+};
 
 std::uint64_t count_revisions(const StoreState& state) noexcept {
   std::uint64_t total = 0U;
@@ -501,11 +533,34 @@ std::uint64_t count_revisions(const StoreState& state) noexcept {
   return total;
 }
 
-Result<StoreState> decode_store_state(std::span<const std::uint8_t> data) {
+Result<DecodedSnapshot> decode_store_state(std::span<const std::uint8_t> data) {
   if (data.size() > kMaxFramePayloadBytes) {
     return Status(StatusCode::OutOfRange, "the snapshot payload exceeds the frame bound");
   }
-  ByteReader reader(data);
+  // The frame payload is the canonical state wrapped in a length-prefixed blob, followed by
+  // the snapshot's own metadata. The blob is unwrapped before the state is decoded: reading the
+  // state directly from the frame payload would interpret the blob length as the format version.
+  ByteReader outer(data);
+  const Bytes body = outer.blob(kMaxFramePayloadBytes);
+  if (!outer.ok()) {
+    return Status(StatusCode::TruncatedPayload, "the snapshot payload does not hold a bounded state blob");
+  }
+  if (outer.remaining() < 8U * 8U) {
+    return Status(StatusCode::TruncatedPayload, "the snapshot payload is missing its metadata block");
+  }
+  SnapshotMetadata metadata;
+  metadata.snapshot_epoch = outer.u64();
+  metadata.source_epoch = outer.u64();
+  metadata.envelope_count = outer.u64();
+  metadata.revision_count = outer.u64();
+  metadata.decision_count = outer.u64();
+  metadata.usage_entry_count = outer.u64();
+  metadata.observation_count = outer.u64();
+  metadata.compaction_count = outer.u64();
+  if (!outer.ok() || !outer.require_exhausted()) {
+    return Status(StatusCode::TrailingBytes, "the snapshot payload holds more than one state blob and one metadata block");
+  }
+  ByteReader reader(body);
   StoreState state;
   const std::uint16_t version = reader.u16();
   const std::uint32_t layout = reader.u32();
@@ -538,6 +593,16 @@ Result<StoreState> decode_store_state(std::span<const std::uint8_t> data) {
       record.content_digest = content_digest(envelope.value());
       record.envelope = std::move(envelope.value());
       entry.revisions.push_back(std::move(record));
+    }
+    const std::uint32_t key_count = reader.u32();
+    if (!reader.ok() || key_count > kMaxRetainedRevisionsPerEnvelope) {
+      return Status(StatusCode::OutOfRange, "the snapshot declares too many revision keys");
+    }
+    for (std::uint32_t key_index = 0; key_index < key_count; ++key_index) {
+      const std::string key = reader.text(kIdempotencyKeyMaxLength);
+      const std::uint64_t revision = reader.u64();
+      if (!reader.ok()) return Status(StatusCode::TruncatedPayload, "a stored revision key is truncated");
+      entry.revision_keys[key] = revision;
     }
     state.envelopes[id] = std::move(entry);
   }
@@ -612,10 +677,24 @@ Result<StoreState> decode_store_state(std::span<const std::uint8_t> data) {
     return Status(reader.ok() ? StatusCode::TrailingBytes : StatusCode::TruncatedPayload,
                   "the snapshot payload did not decode exactly");
   }
+  // The state and the metadata that accompanies it must agree, so a snapshot cannot report
+  // one set of counters and carry another.
   if (state.revision_count != count_revisions(state)) {
     return Status(StatusCode::StoreIntegrityMismatch, "the snapshot revision count disagrees with its content");
   }
-  return state;
+  if (metadata.envelope_count != state.envelopes.size() ||
+      metadata.revision_count != state.revision_count ||
+      metadata.decision_count != state.decisions.size() ||
+      metadata.usage_entry_count != state.usage_entry_count ||
+      metadata.observation_count != state.observations.size() ||
+      metadata.compaction_count != state.compaction_count) {
+    return Status(StatusCode::StoreIntegrityMismatch,
+                  "the snapshot metadata disagrees with the state it carries");
+  }
+  DecodedSnapshot decoded;
+  decoded.state = std::move(state);
+  decoded.metadata = metadata;
+  return decoded;
 }
 
 }  // namespace
@@ -737,11 +816,11 @@ class Store::Impl {
   [[nodiscard]] Status publish_manifest(const Manifest& manifest);
   [[nodiscard]] Status scan_segments(std::vector<std::uint64_t>& epochs) const;
   [[nodiscard]] Status replay_into(StoreState& state, bool& from_snapshot);
-  [[nodiscard]] Status read_snapshot_segment(std::uint64_t epoch, StoreState& state,
-                                            std::uint64_t& frames) const;
+  [[nodiscard]] Status read_snapshot_segment(std::uint64_t epoch, StoreState& state, std::uint64_t& frames,
+                                            SnapshotMetadata& metadata) const;
   [[nodiscard]] Status read_delta_segment(std::uint64_t epoch, StoreState& state, std::uint64_t& frames,
                                           std::size_t& tail_bytes) const;
-  [[nodiscard]] Status cut_segment_to_committed();
+  [[nodiscard]] Status cut_segment_to_committed(std::uint64_t delta_epoch);
   [[nodiscard]] Status write_snapshot_segment(std::uint64_t epoch, const StoreState& state,
                                               std::uint64_t& frames);
   [[nodiscard]] Status remove_file_if_present(const std::filesystem::path& path, bool& removed) const;
@@ -926,9 +1005,10 @@ Status Store::Impl::scan_segments(std::vector<std::uint64_t>& epochs) const {
   return Status{};
 }
 
-Status Store::Impl::read_snapshot_segment(std::uint64_t epoch, StoreState& state,
-                                          std::uint64_t& frames) const {
+Status Store::Impl::read_snapshot_segment(std::uint64_t epoch, StoreState& state, std::uint64_t& frames,
+                                          SnapshotMetadata& metadata) const {
   frames = 0U;
+  metadata = SnapshotMetadata{};
   const std::filesystem::path path = segments_path() / segment_file_name(epoch);
   Result<internal::FileHandle> handle = internal::FileHandle::open_read(path);
   if (!handle.ok()) {
@@ -987,9 +1067,10 @@ Status Store::Impl::read_snapshot_segment(std::uint64_t epoch, StoreState& state
     if (get_u16(frame_header, 10U) != static_cast<std::uint16_t>(JournalEntryKind::Snapshot)) {
       return Status(StatusCode::StoreCorrupt, "a snapshot segment holds a non-snapshot frame");
     }
-    Result<StoreState> decoded = decode_store_state(payload);
+    Result<DecodedSnapshot> decoded = decode_store_state(payload);
     if (!decoded.ok()) return decoded.status();
-    state = std::move(decoded.value());
+    state = std::move(decoded.value().state);
+    metadata = decoded.value().metadata;
     ++frames_read;
     offset += kFrameHeaderBytes + payload_length;
   }
@@ -1087,11 +1168,19 @@ Status Store::Impl::replay_into(StoreState& state, bool& from_snapshot) {
   recovery_.unreadable_tail_bytes = 0U;
   if (manifest_.snapshot_segment != 0U) {
     std::uint64_t frames = 0U;
-    const Status status = read_snapshot_segment(manifest_.snapshot_segment, state, frames);
+    SnapshotMetadata metadata;
+    const Status status = read_snapshot_segment(manifest_.snapshot_segment, state, frames, metadata);
     if (!status.ok()) return status;
     if (frames != manifest_.snapshot_frames) {
       return Status(StatusCode::StoreIntegrityMismatch,
                     "the snapshot holds a different frame count than the manifest records");
+    }
+    // The snapshot's own metadata must agree with the manifest that names it, so a segment
+    // and a manifest from different generations cannot be combined into one state.
+    if (metadata.snapshot_epoch != manifest_.snapshot_segment ||
+        metadata.compaction_count != manifest_.compaction_count) {
+      return Status(StatusCode::StoreIntegrityMismatch,
+                    "the snapshot metadata does not match the manifest that names it");
     }
     from_snapshot = true;
     recovery_.recovered_from_snapshot = true;
@@ -1103,9 +1192,10 @@ Status Store::Impl::replay_into(StoreState& state, bool& from_snapshot) {
     if (!status.ok()) return status;
     recovery_.unreadable_tail_bytes = tail;
   }
-  // The compaction count belongs to the store rather than to the decoded state, so it
-  // is restored from the manifest that authorised the current generation.
-  state.compaction_count = manifest_.compaction_count;
+  // The compaction count is part of the state and is carried inside the snapshot, so it is
+  // not re-derived here: the digest that follows has to be computed over the state exactly as
+  // it was written, or a store would refuse a snapshot it produced itself.
+  if (manifest_.snapshot_segment == 0U) state.compaction_count = manifest_.compaction_count;
   const Digest computed = store_state_digest(state);
   if (manifest_.state_digest.known() && manifest_.state_digest != computed) {
     // The recorded digest is a commitment to the exact state those frames produce. A
@@ -1165,9 +1255,19 @@ Status Store::Impl::refresh_total_bytes() {
   return Status{};
 }
 
-Status Store::Impl::cut_segment_to_committed() {
+Status Store::Impl::cut_segment_to_committed(std::uint64_t delta_epoch) {
   const std::uint64_t committed_delta_frames = manifest_.frames_committed - manifest_.snapshot_frames;
-  const std::uint64_t epoch = manifest_.delta_segment != 0U ? manifest_.delta_segment : manifest_.epoch;
+  const std::uint64_t epoch = delta_epoch;
+  // A committed snapshot generation accounts for every committed frame, so it has no delta to
+  // cut. Without this guard the pre-flight truncation runs against the snapshot segment itself
+  // - which the manifest names, and which therefore must never be shortened - and destroys the
+  // generation the manifest is committed to.
+  if (manifest_.snapshot_frames >= manifest_.frames_committed) {
+    if (manifest_.delta_segment == epoch) {
+      return Status(StatusCode::StoreCorrupt, "the manifest accounts for every frame inside its snapshot yet names a delta segment");
+    }
+    return Status{};
+  }
   const std::filesystem::path path = segments_path() / segment_file_name(epoch);
   std::error_code error;
   if (!std::filesystem::exists(path, error)) {
@@ -1275,7 +1375,10 @@ Status Store::Impl::write_snapshot_segment(std::uint64_t epoch, const StoreState
 Status Store::Impl::open() {
   Status status = ensure_layout();
   if (!status.ok()) return status;
-  status = acquire(internal::LockMode::Exclusive);
+  // A read-only handle takes a shared lock and a writable handle takes an exclusive one, which
+  // is what makes the store single-writer and multi-reader rather than single-handle.
+  status = acquire(options_.mode == OpenMode::ReadOnly ? internal::LockMode::Shared
+                                                       : internal::LockMode::Exclusive);
   if (!status.ok()) return status;
   std::error_code error;
   const bool manifest_present = std::filesystem::exists(manifest_path(), error) && !error;
@@ -1310,24 +1413,29 @@ Status Store::Impl::open() {
     // A crash between the frame writes and the manifest publication leaves frames that
     // no publication named. They are removed so the segment holds exactly the committed
     // prefix, which is what makes the next commit verifiable.
-    status = cut_segment_to_committed();
+    status = cut_segment_to_committed(manifest_.delta_segment != 0U ? manifest_.delta_segment
+                                                                    : manifest_.epoch);
     if (!status.ok()) return status;
   }
   if (options_.mode == OpenMode::ReadOnly) {
-    // A reader keeps no write handle. Nothing in the read path writes, and holding no
-    // write handle makes that a property of the process rather than of the code path.
+    // A reader keeps no write handle. Nothing in the read path writes, and holding no write
+    // handle makes that a property of the process rather than of the code path. The shared lock
+    // is kept for the lifetime of the handle, so a reader neither excludes another reader nor
+    // has to acquire anything later.
     delta_file_ = internal::FileHandle();
     delta_open_ = false;
-    lock_ = internal::FileLock();
   }
   return refresh_total_bytes();
 }
 
 Status Store::Impl::read_snapshot(const std::function<Status(const StoreState&)>& body) {
-  // The lock is already held for the lifetime of the handle. It is never acquired twice
-  // and never upgraded, so no calling path can deadlock against itself.
+  // The lock is acquired once, at open, and held for the lifetime of the handle: exclusively for
+  // a writable handle and shared for a read-only one. It is never acquired twice, never upgraded
+  // and never taken on demand, so no path can deadlock against itself and a reader never
+  // excludes another reader.
   if (!lock_.held()) {
-    const Status status = acquire(internal::LockMode::Exclusive);
+    const Status status = acquire(options_.mode == OpenMode::ReadOnly ? internal::LockMode::Shared
+                                                                     : internal::LockMode::Exclusive);
     if (!status.ok()) return status;
   }
   StoreState state;
@@ -1335,6 +1443,22 @@ Status Store::Impl::read_snapshot(const std::function<Status(const StoreState&)>
   const Status status = replay_into(state, from_snapshot);
   if (!status.ok()) return status;
   return body(state);
+}
+
+// The status a fault-injected commit exits with. It is deliberately not a status the library
+// ever returns, so a validation run can tell an injected abort from a refused operation.
+constexpr int kCommitAbortExitCode = 3;
+
+// A fault-injection directive used by the crash-recovery validation. It is a documented
+// environment variable rather than a hidden hook: it only ever terminates the process, it never
+// changes what is written or what is decided, and it is inert unless a caller sets it. It exists
+// so that an interrupted commit can be produced on demand, at the exact stage boundary, instead
+// of being approximated.
+void terminate_at_commit_stage(const char* stage) noexcept {
+  const char* const directive = std::getenv("RESOURCE_ENVELOPE_ABORT_AT");
+  if (directive == nullptr) return;
+  if (std::strcmp(directive, stage) != 0) return;
+  std::_Exit(kCommitAbortExitCode);
 }
 
 Status Store::Impl::write_transaction(const std::function<Status(JournalSession&)>& body) {
@@ -1374,8 +1498,29 @@ Status Store::Impl::write_transaction(const std::function<Status(JournalSession&
   status = write_fence(new_epoch, false);
   if (!status.ok()) return status;
 
+  terminate_at_commit_stage("fence");
   // Stage two: append every frame to the delta segment.
-  const std::uint64_t delta_epoch = manifest_.delta_segment != 0U ? manifest_.delta_segment : new_epoch;
+  //
+  // A store that already has an open delta appends to it. A store that has none - because it has
+  // just been opened, or because it has just been compacted - needs a segment that collides with
+  // no existing generation. On open, the commit epoch is the delta segment's own name, because
+  // the publication that preceded it named no new segment. After a compaction the commit epoch is
+  // the *snapshot* segment's name, so reusing it would truncate the snapshot the manifest still
+  // names. The two cases are told apart by whether the generation's frame budget is already
+  // accounted for by the snapshot.
+  std::uint64_t delta_epoch = manifest_.delta_segment;
+  if (delta_epoch == 0U) {
+    const std::uint64_t named_by_snapshot = manifest_.snapshot_frames;
+    if (named_by_snapshot >= manifest_.frames_committed) {
+      // Every committed frame belongs to the snapshot, so this generation has no delta yet.
+      // The next segment is allocated above every generation the manifest names.
+      delta_epoch = manifest_.epoch;
+      if (manifest_.snapshot_segment > delta_epoch) delta_epoch = manifest_.snapshot_segment;
+      ++delta_epoch;
+    } else {
+      delta_epoch = manifest_.epoch;
+    }
+  }
   if (!delta_open_ || delta_epoch_ != delta_epoch) {
     delta_file_ = internal::FileHandle();
     const std::filesystem::path path = segments_path() / segment_file_name(delta_epoch);
@@ -1398,8 +1543,6 @@ Status Store::Impl::write_transaction(const std::function<Status(JournalSession&
     }
     delta_epoch_ = delta_epoch;
     delta_open_ = true;
-    const Status cut = cut_segment_to_committed();
-    if (!cut.ok()) return cut;
   }
 
   struct PendingFrame {
@@ -1433,6 +1576,7 @@ Status Store::Impl::write_transaction(const std::function<Status(JournalSession&
 
   // Stage three: flush the segment and read every frame back through the same handle,
   // verifying the bytes that were actually written.
+  terminate_at_commit_stage("frames");
   status = delta_file_.flush();
   if (!status.ok()) return status;
   for (const PendingFrame& record : pending) {
@@ -1458,11 +1602,13 @@ Status Store::Impl::write_transaction(const std::function<Status(JournalSession&
   }
 
   // Stage four: publish the manifest. This replacement is the commit point.
+  terminate_at_commit_stage("verify");
   Manifest next = manifest_;
   next.epoch = new_epoch;
   next.state_epoch = new_epoch;
   next.state_sequence = state.state_sequence;
   next.delta_segment = delta_epoch;
+  terminate_at_commit_stage("publish");
   next.frames_committed = state.state_sequence;
   next.envelope_count = state.envelopes.size();
   next.revision_count = state.revision_count;
@@ -1528,7 +1674,6 @@ Status Store::Impl::compact() {
   std::uint64_t frames = 0U;
   status = write_snapshot_segment(new_epoch, state, frames);
   if (!status.ok()) return status;
-
   Manifest next = manifest_;
   next.epoch = new_epoch;
   next.state_epoch = new_epoch;
@@ -1550,7 +1695,10 @@ Status Store::Impl::compact() {
   const std::uint64_t previous_snapshot = manifest_.snapshot_segment;
   const std::uint64_t previous_delta = manifest_.delta_segment;
   manifest_ = next;
-  delta_epoch_ = new_epoch;
+  // The snapshot epoch is not a delta segment, so no open delta is carried over: the next
+  // append allocates one of its own.
+  delta_open_ = false;
+  delta_epoch_ = 0U;
 
   // Superseded segments are removed only after the manifest that stops naming them is
   // durable. A crash before this point leaves them present and unreferenced, which the
@@ -1565,6 +1713,7 @@ Status Store::Impl::compact() {
     if (!status.ok()) return status;
   }
   status = collect_garbage();
+
   if (!status.ok()) return status;
   return refresh_total_bytes();
 }

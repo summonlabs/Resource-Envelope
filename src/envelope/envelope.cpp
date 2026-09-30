@@ -153,10 +153,23 @@ const char* to_string(MergeDominance dominance) noexcept {
   return "unknown-dominance";
 }
 
-Result<MergeResult> merge_envelopes(const Envelope& base, const Envelope& overlay, MergePolicy policy) {
+Result<MergeResult> merge_envelopes(const Envelope& left, const Envelope& right, MergePolicy policy) {
   // Composition is only meaningful across different scopes. Two envelopes for the
   // same scope are versions of one authority, not two constraints on one subject,
   // and combining them would invent authority that no declaration granted.
+  //
+  // The overlay supplies the identity, bindings and declared precedence order of the result, so
+  // the two arguments are not interchangeable. Rather than report different results for the two
+  // spellings of one composition, the arguments are canonicalised first: they are ordered by
+  // envelope identifier, then revision, then record digest, which is a strict total order over
+  // distinct envelopes. Both spellings then compute exactly one result.
+  const bool left_first = left.id != right.id
+                              ? left.id < right.id
+                              : (left.revision != right.revision
+                                     ? left.revision < right.revision
+                                     : record_digest(left).to_string() < record_digest(right).to_string());
+  const Envelope& base = left_first ? left : right;
+  const Envelope& overlay = left_first ? right : left;
   if (base.scope == overlay.scope) {
     return Status(StatusCode::AmbiguousOverlap,
                   "both envelopes address the same scope; compose revisions instead");

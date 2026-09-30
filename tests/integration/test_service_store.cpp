@@ -157,13 +157,13 @@ RE_TEST(idempotent_authorisation_replay_returns_the_recorded_decision) {
   const Result<AuthorizeResult> second = service.value()->authorize(request);
   RE_REQUIRE(second.ok());
   RE_CHECK(second.value().replayed);
-  // KNOWN GAP: a replayed authorisation returns the recorded decision sequence and the
-  // recorded reason and outcome, but the decision digest computed for the replay differs
-  // from the digest recorded with the original decision. The durable record is identical
-  // and the replay appends nothing; the divergence is in the digest projection.
+  // The replay returns the recorded decision exactly, including its digest: a caller that
+  // retries a request it never saw the answer to must receive the original answer, not a
+  // recomputed lookalike.
   RE_CHECK_EQ(second.value().record.sequence, first.value().record.sequence);
   RE_CHECK_EQ(second.value().record.reason, first.value().record.reason);
   RE_CHECK_EQ(second.value().record.outcome, first.value().record.outcome);
+  RE_CHECK_EQ(second.value().record.decision_digest, first.value().record.decision_digest);
   RE_CHECK_EQ(second.value().record.sequence, first.value().record.sequence);
   RE_CHECK_EQ(service.value()->statistics().value().decision_count, decisions_after_first);
 }
@@ -211,12 +211,14 @@ RE_TEST(revision_advances_the_epoch_and_fences_earlier_grants) {
   RE_CHECK_EQ(revised.value().revision, 2ULL);
   RE_CHECK(revised.value().record_digest.known());
 
-  // KNOWN GAP: replaying a revision against a reopened store is not recognised as a
-  // replay. The first revision is accepted and durable (asserted above); recognising the
-  // repeat after recovery is under investigation, and until then a retried revision is
-  // refused rather than silently re-applied.
+  // A retried revision is resolved as a replay and does not advance authority again. The
+  // revision number of the first attempt is derived from the authority at that time, so the
+  // replay is resolved by the caller's idempotency key rather than by reconstructing it.
   const Result<EnvelopeRevision> replay = service.value()->revise(revise);
-  RE_CHECK(!replay.ok());
+  RE_REQUIRE(replay.ok());
+  RE_CHECK(replay.value().replayed);
+  RE_CHECK_EQ(replay.value().revision, 2ULL);
+  RE_CHECK_EQ(replay.value().record_digest, revised.value().record_digest);
 
   // A stale expectation is refused after replay resolution has had its chance.
   ReviseInput stale = revise;
@@ -307,6 +309,15 @@ RE_TEST(usage_deltas_fold_and_replay_without_double_counting) {
 
 RE_TEST(compaction_preserves_state_and_digest) {
   const ScratchStore scratch("re-store-compact");
+  Digest committed_state;
+  Digest declared_digest;
+  std::uint64_t envelope_count = 0U;
+  std::uint64_t state_sequence = 0U;
+  // The writer lock lives as long as a service that can write, so the work is done inside a
+  // nested scope that owns the handle and is finished before the store is reopened. This is a
+  // local shadow rather than a block around the opening result, because a block cannot end the
+  // lifetime of the opening result declared outside it.
+  {
   const Result<std::unique_ptr<EnvelopeService>> service =
       EnvelopeService::open(scratch.path(), create_options());
   RE_REQUIRE(service.ok());
@@ -315,20 +326,44 @@ RE_TEST(compaction_preserves_state_and_digest) {
   input.idempotency_key = "declare-1";
   input.requested_at = 1767225600000000000LL;
   RE_REQUIRE(service.value()->declare(input).ok());
-  const Digest before = service.value()->statistics().value().state_digest;
+  const Result<StoreStatistics> before = service.value()->statistics();
+  RE_REQUIRE(before.ok());
   const Status compacted = service.value()->compact();
   RE_REQUIRE(compacted.ok());
-  // KNOWN GAP: reading statistics back after a compaction fails. The compaction itself
-  // reports success and publishes a snapshot that the manifest names; reopening that store
-  // is not yet verified, so this case asserts only that the compaction was accepted.
+
+  // Compaction rewrites the store without changing what it says, so the state commitment is
+  // identical before and after, and the store reports exactly one compaction.
   const Result<StoreStatistics> stats = service.value()->statistics();
-  RE_CHECK(!stats.ok());
-  static_cast<void>(before);
-  // KNOWN GAP: reading the envelope back from the service after a compaction fails even
-  // though the compaction reported success, so this case asserts only that the compaction
-  // was accepted. Reopening a compacted store is not yet verified.
+  RE_REQUIRE(stats.ok());
+  RE_CHECK_EQ(stats.value().state_digest, before.value().state_digest);
+  RE_CHECK_EQ(stats.value().compaction_count, 1ULL);
+  RE_CHECK_EQ(stats.value().envelope_count, before.value().envelope_count);
+  RE_CHECK_EQ(stats.value().state_sequence, before.value().state_sequence);
+
   const Result<EnvelopeView> view = service.value()->get_envelope("tenant-a-envelope");
-  RE_CHECK(!view.ok());
+  RE_REQUIRE(view.ok());
+  RE_CHECK_EQ(view.value().envelope.revision, 1ULL);
+
+  committed_state = stats.value().state_digest;
+  declared_digest = view.value().record_digest;
+  envelope_count = stats.value().envelope_count;
+  state_sequence = stats.value().state_sequence;
+  }
+
+  // A compacted store is a store: the whole point of compaction is that it can be reopened.
+  const Result<std::unique_ptr<EnvelopeService>> reopened =
+      EnvelopeService::open(scratch.path(), existing_options(OpenMode::OpenExisting));
+  RE_REQUIRE(reopened.ok());
+  const Result<EnvelopeView> reread = reopened.value()->get_envelope("tenant-a-envelope");
+  RE_REQUIRE(reread.ok());
+  RE_CHECK_EQ(reread.value().envelope.revision, 1ULL);
+  RE_CHECK_EQ(reread.value().record_digest, declared_digest);
+  const Result<StoreStatistics> reopened_stats = reopened.value()->statistics();
+  RE_REQUIRE(reopened_stats.ok());
+  RE_CHECK_EQ(reopened_stats.value().state_digest, committed_state);
+  RE_CHECK_EQ(reopened_stats.value().compaction_count, 1ULL);
+  RE_CHECK_EQ(reopened_stats.value().envelope_count, envelope_count);
+  RE_CHECK_EQ(reopened_stats.value().state_sequence, state_sequence);
 }
 
 RE_TEST(retirement_stops_an_envelope_being_authoritative) {
@@ -349,11 +384,10 @@ RE_TEST(retirement_stops_an_envelope_being_authoritative) {
   const Result<TombstoneResult> retired = service.value()->tombstone(retire);
   RE_REQUIRE(retired.ok());
   RE_CHECK(!retired.value().replayed);
-  // KNOWN GAP: a retried retirement is refused rather than resolved as a replay. The
-  // retirement itself is durable, and the assertion below confirms the envelope stopped
-  // being authoritative, which is the property that matters for safety.
+  // A retried retirement is resolved as a replay, so a lost response is safe to retry.
   const Result<TombstoneResult> replay = service.value()->tombstone(retire);
-  RE_CHECK(!replay.ok());
+  RE_REQUIRE(replay.ok());
+  RE_CHECK(replay.value().replayed);
   const Result<EvaluationResult> refused =
       service.value()->evaluate(request_for("tenant-a", 3U, 1ULL, "eval-1"));
   RE_REQUIRE(refused.ok());

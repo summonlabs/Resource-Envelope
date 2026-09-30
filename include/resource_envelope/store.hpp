@@ -187,6 +187,10 @@ struct RESOURCE_ENVELOPE_API EnvelopeEntry {
   std::vector<EnvelopeRevisionRecord> revisions;
   std::string current_revision_key;
   bool tombstoned = false;
+  // Idempotency key to revision number, for every revision of this envelope. A caller retries a
+  // claim it cannot see the outcome of, so the key that produced a revision is recorded beside
+  // it and a retry is resolved by key rather than by reconstructing a derived revision number.
+  std::map<std::string, std::uint64_t> revision_keys;
 };
 
 struct RESOURCE_ENVELOPE_API CommittedKey {

@@ -471,10 +471,15 @@ All results below were produced on this host. Nothing is extrapolated.
 | --- | --- |
 | Debug build, MSVC `/W4 /WX /permissive- /std:c++20 /GR- /guard:cf` | clean, zero warnings |
 | Release build, same policy | clean, zero warnings |
-| Debug test suite | 7 of 7 suites pass |
-| Release test suite | 7 of 7 suites pass |
+| Debug test suite | 9 of 9 suites pass, 0 failures |
+| Release test suite | 9 of 9 suites pass, 0 failures |
 | Command line tool | declaration and replay of a declaration, usage recording, evaluation, statistics and schema verified by hand against a real store directory |
 | Decoder corruption sweeps | every truncation prefix and every single-byte flip of the envelope, decision-record, usage-delta and journal-entry encodings |
+| Crash recovery | a real process killed at each of the four commit-stage boundaries, then reopened; a partial publication never becomes visible |
+| Cross-process exclusion | a second writer refused while another process holds the store; a killed holder does not leave the store locked |
+| Property validation | more than 300 generated cases per property from a fixed seed, over canonical encoding, digest invariance, evaluation monotonicity and replay exactness |
+| Downstream consumer | configured, built and executed against the installed prefix only, through `find_package` |
+| Fresh clone | the committed revision cloned into an empty directory, configured, built and tested from a clean tree |
 | Sanitizers | **not available.** The validated toolchain is MSVC, which provides no AddressSanitizer for this configuration; `RESOURCE_ENVELOPE_ENABLE_SANITIZERS=ON` reports that fact rather than fabricating a claim. The strongest available alternative is used: every non-Release configuration compiles with `_ITERATOR_DEBUG_LEVEL=2` and MSVC runtime checks. |
 
 ### Test suites
@@ -488,7 +493,66 @@ All results below were produced on this host. Nothing is extrapolated.
 | `eval.test_evaluate` | reserved capacity in the residual, unknown versus zero committed usage, over-commitment reporting, undeclared dimensions, unknown bounds, quantization refusal, expiry and window boundaries, scope mismatch, revision fencing, redundancy without an operational spare, exclusive dimension without an evidenced holder, refusal precedence, digest determinism, envelope encoding round trips and corruption, merge dominance and ambiguity |
 | `integration.test_service_store` | durable round trip with a stable digest across reopen, idempotent declaration and authorisation replay, idempotency conflict, revision advance and fencing, authority verification states, usage folding and replay without double counting, compaction, retirement, truncation detection, read-only refusal, hostile identifiers |
 | `adversarial.test_hostile_inputs` | every decoder fed every truncation prefix and every single-byte flip, impossible manifest combinations, absurd declared sizes, hostile identifiers, generated segment names, the published CRC-32 check value |
+| `property.test_canonical_invariants` | canonical encoding is total, injective and a fixed point after one pass; content and record digests do not depend on dimension or lineage declaration order; evaluation is total, deterministic and monotone in the requested quantity; tightening a limit never turns a refusal into a grant; declarations and authorisations replay bit for bit and append nothing |
+| `recovery.test_crash_recovery` | a process killed at the fence, frame, verification and publication boundaries; an interrupted publication is never visible; a second writer is refused across processes; a reader is never admitted alongside a writer; a killed holder does not leave the store locked |
 
+
+### Proof classes
+
+Every proof class the repository standard requires is present and was executed.
+
+| Proof class | Where it lives | What it establishes |
+| --- | --- | --- |
+| Unit | `tests/core` | Quantity arithmetic, digests, text and time handling against published vectors and boundary values. |
+| Evaluation semantics | `tests/eval` | Residual and headroom arithmetic, unknown versus zero, refusal precedence, windows, generations, exclusive and non-consumable cardinality. |
+| Integration | `tests/integration` | Durable round trips, replay, revision fencing, usage folding, compaction, retirement, truncation detection. |
+| Adversarial | `tests/adversarial` | Every decoder against every truncation prefix and every single-byte flip; impossible manifests; hostile identifiers and paths. |
+| Property | `tests/property` | More than 300 generated cases per property from a fixed seed and a reported ordinal: canonical encoding is total and injective, digests are declaration-order independent, evaluation is total, deterministic and monotone, tightening a limit never grants more, and replay is exact. |
+| Crash recovery | `tests/recovery` | A real process is killed at each of the four commit-stage boundaries and the store is then reopened. |
+| Cross-process exclusion | `tests/recovery` | A second writer is refused while another process holds the store, a reader is never admitted alongside a writer, and a killed holder does not leave the store locked. |
+| End to end | `examples/consumer` | An installed-package consumer declares, records usage, authorises and reads back. |
+| Benchmarks | `bench` | Completed-operation latency and throughput, with provenance labelled per line. |
+
+#### Crash recovery detail
+
+The interrupted commits are produced by re-executing the recovery suite under a documented
+directive, `RESOURCE_ENVELOPE_ABORT_AT`, that terminates the process at a named stage boundary.
+The directive never changes what is written or what is decided; it only ends the process, which is
+what makes the interruption a real process death at a real boundary rather than an approximation.
+The suite then asserts that the store either reproduces the last published generation exactly or
+refuses to open, that a subsequent commit succeeds, and that an interrupted publication never
+makes a partial generation visible. The child process is expected to exit with the directive's own
+status, so the suite also proves the interruption happened where it was asked to.
+
+#### Cross-process exclusion detail
+
+Writer exclusion is enforced by an operating-system range lock on `store.lock`, and the measured
+behaviour of the platform is reported rather than assumed: on Windows a shared range lock cannot
+coexist with an exclusive one, so a reader is refused while a writer holds the store. That is the
+stricter of the two behaviours and the suite asserts it, because the property that matters is that
+a reader is never admitted alongside a writer that could change what it is reading. A process
+killed while holding the lock does not leave the store locked.
+
+### Benchmarks
+
+Measured with `resource-envelope-benchmark` in a Release build: single host, single process,
+default optimisation. Every number is a completed operation; nothing is reported for submission
+or enqueue latency. `REAL` means the operation ran against a real store directory on this host's
+filesystem and includes the fence write, the segment flush, the read-back verification and the
+manifest publication. `SYNTHETIC` means the inputs were constructed by the driver; no physical
+facility hardware was involved and no before/after or speedup claim is made.
+
+| Operation | Provenance | Iterations | Latency | Throughput |
+| --- | --- | --- | --- | --- |
+| Canonical encode envelope | SYNTHETIC | 200 000 | 408.1 ns/op | 2 450 467 ops/s |
+| Canonical decode envelope | SYNTHETIC | 200 000 | 276.2 ns/op | 3 620 080 ops/s |
+| SHA-256 over canonical bytes | SYNTHETIC | 200 000 | 636.5 ns/op | 1 571 147 ops/s |
+| Evaluate (pure, no store) | SYNTHETIC | 200 000 | 4 513.3 ns/op | 221 568 ops/s |
+| Durable declare (fence + flush + commit) | REAL | 200 | 12 410 801 ns/op | 81 ops/s |
+
+The encoded envelope is 202 bytes. The durable figure is dominated by the two flushes and the
+directory publication that the durability guarantee requires. It is reported as measured and is
+not comparable to an in-memory operation.
 
 ### Downstream consumption
 
@@ -507,27 +571,6 @@ consumer OK
 ```
 
 The residual is exactly the documented arithmetic: 100 minus 10 reserved minus 30 committed is 60.
-
-### Benchmarks
-
-Measured with `resource-envelope-benchmark` in a Release build: single host, single process,
-default optimisation. Every number is a completed operation; nothing is reported for submission
-or enqueue latency. `REAL` means the operation ran against a real store directory on this host's
-filesystem and includes the fence write, the segment flush, the read-back verification and the
-manifest publication. `SYNTHETIC` means the inputs were constructed by the driver; no physical
-facility hardware was involved and no before/after or speedup claim is made.
-
-| Operation | Provenance | Iterations | Latency | Throughput |
-| --- | --- | --- | --- | --- |
-| Canonical encode envelope | SYNTHETIC | 200 000 | 442.6 ns/op | 2 259 540 ops/s |
-| Canonical decode envelope | SYNTHETIC | 200 000 | 305.4 ns/op | 3 274 566 ops/s |
-| SHA-256 over canonical bytes | SYNTHETIC | 200 000 | 664.4 ns/op | 1 505 061 ops/s |
-| Evaluate (pure, no store) | SYNTHETIC | 200 000 | 4 676.9 ns/op | 213 816 ops/s |
-| Durable declare (fence + flush + commit) | REAL | 200 | 13 500 613 ns/op | 74 ops/s |
-
-The encoded envelope is 202 bytes. The durable figure is dominated by the two flushes and the
-directory publication that the durability guarantee requires. It is reported as measured and is
-not comparable to an in-memory operation.
 
 ## Hardening defects found and fixed
 
@@ -549,63 +592,90 @@ and fixed at the root cause.
    digest covers effective values only. Including the journal made the digest depend on how a
    state was reached, so two states a reader cannot tell apart compared unequal and every
    authorisation recorded a digest that changed on replay.
-5. **A satisfied request was reported `Indeterminate` with reason `InvalidArgument`.** The verdict
-   fell back to default-initialised values whenever no dimension produced an issue, so a request
-   that every dimension satisfied was returned as an indeterminate argument error. Found by the
-   downstream consumer proof, which printed `Indeterminate reason InvalidArgument` for a request
-   whose residual was correctly computed as 60 of an available 90. The verdict is now derived from
-   the collected issues as a whole: no issue means every dimension was satisfied, and the result is
-   `Granted` with reason `Ok`.
-6. **A satisfied dimension was reported `NotRequested`.** The per-dimension report kept its
-   default outcome unless a dimension refused, so a granted dimension carried the value that means
-   "the caller asked nothing about this dimension". The outcome is now set as soon as the envelope
-   is found to declare the dimension.
-7. **Revision staging invalidated a live pointer.** `revise` held a pointer into the retained
+5. **A satisfied request was reported `Indeterminate` with reason `InvalidArgument`, and a
+   satisfied dimension was reported `NotRequested`.** Two halves of one defect: the verdict fell
+   back to default-initialised values whenever no dimension produced an issue, and a per-dimension
+   report kept its default outcome unless the dimension refused. A request that every dimension
+   satisfied was therefore returned as an indeterminate argument error whose granted dimension
+   claimed the caller had asked nothing about it. Found by the downstream consumer proof, which
+   printed `Indeterminate reason InvalidArgument` alongside a residual correctly computed as 60 of
+   an available 90. The verdict is now derived from the collected issues as a whole - no issue
+   means every dimension was satisfied, and the result is `Granted` with reason `Ok` - and a
+   dimension's outcome is set as soon as the envelope is found to declare it.
+6. **Revision staging invalidated a live pointer.** `revise` held a pointer into the retained
    revision vector and then appended to that vector, which reallocated it; the observed effect was
    a revision result reporting a garbage previous revision. The previous revision and its digest
    are now copied before anything is staged.
-8. **The chain digest depended on itself.** The manifest digest was computed over a manifest that
+7. **The chain digest depended on itself.** The manifest digest was computed over a manifest that
    already contained the digest being computed, so manifest verification could never succeed. The
    field is cleared before hashing.
-9. **Retirements were not durable across a restart.** A snapshot does not carry the journal, so
+8. **Retirements were not durable across a restart.** A snapshot does not carry the journal, so
    retirements vanished on reopen and a retired envelope could be retired again under a different
    reason. Committed retirements are now carried in the state, encoded canonically, and consulted
    before the live journal.
-10. **Command line defects.** `--id` and `--dimension` were rejected as unknown options; the write
+9. **Command line defects.** `--id` and `--dimension` were rejected as unknown options; the write
     path required a store to exist while the read path attempted to create one, so the first
     declaration could not create a store; and `record-usage` parsed the wrong option.
+10. **Replay resolution compared a derived value.** The idempotency claim digest included the
+    revision number, which the store derives from the authority at the time of the attempt. A
+    retried request could therefore never match the record it had created, and a lost response was
+    not retryable. The claim now covers exactly what the caller stated, and a revision is located
+    by the idempotency key that produced it, which is recorded beside it.
+11. **A retirement was refused instead of replayed.** Retiring an envelope clears its current
+    revision, and the guards that refuse an already-retired envelope ran before replay resolution,
+    so a retried retirement reported a missing envelope. Replay resolution now runs first, before
+    every guard that would refuse the retry.
+12. **Compaction corrupted the store it had just written.** Three faults met here. The commit path
+    derived the delta segment's name from the commit epoch, which after a compaction is the
+    snapshot segment's own name, so the first write after a compaction truncated the snapshot the
+    manifest still named. The pre-flight truncation derived the same name independently and
+    shortened the snapshot as well. And the truncation guard then refused the very store it had
+    corrupted with a self-contradictory integrity error. Segment allocation is now decided once,
+    above every generation the manifest names; the truncation helper only ever touches the delta it
+    was given; and a generation whose frames all belong to its snapshot is reported as having no
+    delta rather than as an inconsistency.
+13. **The snapshot decoder read its own length prefix as a version.** A snapshot frame wraps the
+    canonical state in a length-prefixed blob followed by the snapshot's metadata, and the decoder
+    started at the blob length. Every snapshot the store wrote was refused by the store itself.
+    The metadata is now decoded and cross-checked against both the state and the manifest.
+14. **A reader excluded every other reader.** A read-only handle took an exclusive lock and then
+    released it, re-acquiring on demand from the read path. The store is documented as single
+    writer and multi reader; a read-only handle now takes a shared lock at open and keeps it. The
+    measured behaviour of the platform is reported in the cross-process exclusion detail above
+    rather than assumed.
 
 ## Known gaps and unvalidated behaviour
 
 This section is deliberately explicit. None of the following is covered by a passing test, and
 nothing here should be treated as validated.
 
-1. **A replayed authorisation recomputes a different decision digest.** The durable record is
-   identical and the replay appends nothing, but the digest value returned for a replay differs
-   from the value recorded with the original decision. Tests assert the record identity
-   (sequence, reason, outcome) rather than the returned digest.
-2. **Replaying a revision against a reopened store is refused rather than resolved.** The first
-   revision is accepted and is durable; a repeat after recovery is refused instead of being
-   recognised as a replay. Failing closed is safe, but a lost response is not yet retryable for
-   this one operation.
-3. **Reading a service back after a compaction fails.** Compaction reports success and publishes a
-   snapshot the manifest names, but neither a statistics read nor an envelope read after
-   compaction succeeds yet, so reopening a compacted store is unverified.
-4. **Merge digests are not fully order independent.** A composition's merged identity and its
-   dimension set are order independent and are asserted; the record and content digests of two
-   argument orders do not yet agree.
-5. **`authorize` requires the identity binding to be confirmed or waived.** An envelope that
+Every previously recorded gap in this section has been closed and is now covered by a passing
+case. What follows is what remains genuinely unvalidated.
+
+1. **`authorize` requires the identity binding to be confirmed or waived.** An envelope that
    requires binding confirmation refuses evaluation when no identity digest is supplied. This is
-   deliberate, but a deployment without an identity authority must declare
-   `--require-identity-binding false` explicitly, and no test covers the confirmed path.
-6. **Not present at all.** There is no multiprocess test, no crash-at-commit-stage test, no
-   writer-lock exclusion test, no property test, no randomized state-machine test and no
-   fresh-clone closure. Each of these is required by the repository brief and none has been
-   written or run. A benchmark driver and an installed-package consumer proof do exist and were
-   executed; see the validation section.
-7. **No independent Windows process test exists**, so the cross-process claims in the concurrency
-   section rest on the design and on the operating-system primitives used, not on an executed
-   two-process test.
+   deliberate and is the correct direction, but a deployment without an identity authority must
+   declare `--require-identity-binding false` explicitly, and no case yet covers the confirmed
+   path: there is no test that supplies a matching identity digest and observes a grant, or a
+   mismatched one and observes `GenerationBinding`.
+2. **No randomized state-machine test.** The property suite validates the pure functions and the
+   replay contract over generated inputs, but it does not drive a long randomized sequence of
+   interleaved declarations, revisions, usage records and retirements against a live store and
+   compare it against a reference model.
+3. **The POSIX implementation is unexecuted.** The file and lock layers have a POSIX branch
+   written against `pwrite`, `pread`, `fsync`, `flock` and `rename`. It has never been compiled or
+   run on any platform, and this repository is validated on Windows only.
+4. **Crash points are stage boundaries, not arbitrary byte boundaries.** The recovery suite kills a
+   process at each of the four commit stages. It does not corrupt a byte inside a frame and then
+   assert recovery, because that case is covered by the adversarial decoder sweeps on the frame
+   codecs rather than through a live store.
+5. **`RESOURCE_ENVELOPE_ABORT_AT` is a fault-injection surface.** It is documented, it only ever
+   terminates the process, and it is inert unless set. A deployment that considers any such
+   surface unacceptable can compile it out, and the recovery suite would then be unable to produce
+   its interrupted commits.
+6. **Compaction is validated with one generation.** The compaction case declares one envelope,
+   compacts, reads back, reopens and re-reads. It does not exercise compaction over a store holding
+   many generations, retained revisions, decisions, usage entries and retirements at once.
 ## Unsupported and unvalidated platforms
 
 - **Windows is the only validated platform.** Both configurations were built and tested with

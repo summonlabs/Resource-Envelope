@@ -35,11 +35,14 @@ EnvelopeView make_view(const EnvelopeEntry& entry, const EnvelopeRevisionRecord&
   return view;
 }
 
-// The exact claim a declaration or a revision makes. The provenance timestamp and the
-// supersedes pointer are excluded, so the same declaration replayed later is the same
-// claim, while any change to a constraint produces a different digest.
+// The exact claim a declaration or a revision makes. A retried request must produce the same
+// claim as the request it retries, so everything the store derives or that varies between
+// attempts is cleared: the revision number is derived, the supersedes pointer is written by the
+// store, and the provenance timestamp is when the attempt happened rather than what it claimed.
+// What remains is the caller's statement: scope, bindings, window and constraints.
 Digest declaration_payload_digest(const Envelope& envelope) {
   Envelope normalized = envelope;
+  normalized.revision = 0U;
   normalized.provenance.declared_at = 0;
   normalized.supersedes.reset();
   const Bytes body = canonical_envelope(normalized);
@@ -417,15 +420,25 @@ Result<EnvelopeRevision> ServiceImpl::revise(const ReviseInput& input) {
     // revision vector, which can reallocate it and invalidate a pointer into it.
     const std::uint64_t previous_revision = current->envelope.revision;
     const Digest previous_digest = current->record_digest;
-    Envelope candidate = envelope;
-    candidate.revision = previous_revision + 1U;
-    const Digest requested_payload = declaration_payload_digest(candidate);
-    if (find_revision_record(found->second, candidate.revision) != nullptr) {
-      const EnvelopeRevisionRecord* existing = find_revision_record(found->second, candidate.revision);
-      if (declaration_payload_digest(existing->envelope) == requested_payload) {
+    // Replay resolution runs before every freshness check, because the whole point of the check
+    // is to make a lost response safe to retry after the authority has moved. The key is what
+    // identifies the retry: the revision number the first attempt produced is derived from the
+    // authority at that time and cannot be reconstructed from the request.
+    const auto prior = found->second.revision_keys.find(input.idempotency_key);
+    if (prior != found->second.revision_keys.end()) {
+      const EnvelopeRevisionRecord* existing = find_revision_record(found->second, prior->second);
+      if (existing == nullptr) {
+        failure = Status(StatusCode::StoreCorrupt,
+                          "a recorded revision key names a revision that is not retained");
+        return failure;
+      }
+      Envelope replayed_claim = envelope;
+      replayed_claim.revision = existing->envelope.revision;
+      replayed_claim.supersedes = existing->envelope.supersedes;
+      if (declaration_payload_digest(replayed_claim) == declaration_payload_digest(existing->envelope)) {
         EnvelopeRevision replayed;
         replayed.envelope_id = envelope.id;
-        replayed.previous_revision = previous_revision;
+        replayed.previous_revision = existing->envelope.revision == 0U ? 0U : existing->envelope.revision - 1U;
         replayed.revision = existing->envelope.revision;
         replayed.record_digest = existing->record_digest;
         replayed.content_digest = existing->content_digest;
@@ -435,9 +448,12 @@ Result<EnvelopeRevision> ServiceImpl::revise(const ReviseInput& input) {
         return Status{};
       }
       failure = Status(StatusCode::IdempotencyConflict,
-                        "a revision with the requested number already exists and differs from this request");
+                        "this idempotency key is already recorded against a different revision claim");
       return failure;
     }
+    Envelope candidate = envelope;
+    candidate.revision = previous_revision + 1U;
+    const Digest requested_payload = declaration_payload_digest(candidate);
     if (input.expected_current_revision.has_value() && *input.expected_current_revision != previous_revision) {
       failure = Status(StatusCode::StaleRevision,
                         "the expected current revision is not the current revision");
@@ -515,13 +531,19 @@ Result<AuthorizeResult> ServiceImpl::authorize(const EvaluationRequest& request)
       if (existing != nullptr) {
         AuthorizeResult replayed;
         replayed.record = *existing;
-        replayed.decision_digest = existing->decision_digest;
+        // The digest is the recorded one when the record carries it, and is otherwise
+        // recomputed from the record, so a replay always reports the same value the original
+        // decision reported rather than an absent digest.
+        replayed.decision_digest = existing->decision_digest.known()
+                                       ? existing->decision_digest
+                                       : compute_decision_digest(*existing);
+        replayed.record.decision_digest = replayed.decision_digest;
         replayed.replayed = true;
         replayed.evaluation.outcome = existing->outcome;
         replayed.evaluation.reason = existing->reason;
         replayed.evaluation.stage = existing->stage;
         replayed.evaluation.blocking_dimension = existing->blocking_dimension;
-        replayed.evaluation.decision_digest = existing->decision_digest;
+        replayed.evaluation.decision_digest = replayed.decision_digest;
         replayed.evaluation.decision_sequence = existing->sequence;
         replayed.evaluation.envelope_id = existing->envelope_id;
         replayed.evaluation.envelope_revision = existing->envelope_revision;
@@ -682,19 +704,10 @@ Result<TombstoneResult> ServiceImpl::tombstone(const TombstoneInput& input) {
   std::optional<TombstoneResult> result;
   const Status status = store_->with_writer([&](JournalSession& session) {
     const StoreState& state = session.state();
-    const auto found = state.envelopes.find(input.envelope_id);
-    if (found == state.envelopes.end()) {
-      return Status(StatusCode::EnvelopeNotFound, "no envelope with this identifier exists");
-    }
-    const EnvelopeRevisionRecord* current = current_revision_record(found->second);
-    if (found->second.tombstoned) {
-      if (current == nullptr) {
-        return Status(StatusCode::EnvelopeNotFound, "the envelope is already retired");
-      }
-    }
 
-    // Replay resolution: the same retirement request is resolved without advancing the
-    // epoch, so a retried retirement is idempotent.
+    // Replay resolution runs first, before any guard that refuses an already retired
+    // envelope. A retirement clears the current revision, so resolving the retry after those
+    // guards would report a missing envelope for a retirement that is correctly recorded.
     const auto replay_retirement = [&](const EnvelopeTombstoneEntry& existing) {
       TombstoneResult replayed;
       replayed.envelope_id = existing.envelope_id;
@@ -723,6 +736,12 @@ Result<TombstoneResult> ServiceImpl::tombstone(const TombstoneInput& input) {
       }
       return replay_retirement(*entry.tombstone);
     }
+    // No retirement is recorded for this envelope, so the ordinary guards now apply.
+    const auto found = state.envelopes.find(input.envelope_id);
+    if (found == state.envelopes.end()) {
+      return Status(StatusCode::EnvelopeNotFound, "no envelope with this identifier exists");
+    }
+    const EnvelopeRevisionRecord* current = current_revision_record(found->second);
     if (found->second.tombstoned) {
       return Status(StatusCode::EnvelopeNotFound, "the envelope is already retired");
     }

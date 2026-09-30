@@ -386,10 +386,12 @@ RE_TEST(merge_refuses_ambiguous_overlap_and_permits_dominance) {
   const Result<MergeResult> reversed = merge_envelopes(overlay, base, MergePolicy::TightestWins);
   RE_REQUIRE(reversed.ok());
   RE_CHECK_EQ(reversed.value().envelope.id, dominated.value().envelope.id);
-  // KNOWN GAP: the merged identity is order independent, but neither the record digest nor
-  // the content digest of the two argument orders yet agree. The merged dimensions and
-  // identity are order independent (both asserted above), so the remaining difference is
-  // outside the constraint set and is under investigation.
+  // Composition is fully order independent: both spellings produce the same envelope, the
+  // same canonical bytes, and therefore the same content and record digests. The result is
+  // canonicalised rather than recomputed per spelling, so the two cannot drift apart.
+  RE_CHECK_EQ(record_digest(reversed.value().envelope), record_digest(dominated.value().envelope));
+  RE_CHECK_EQ(content_digest(reversed.value().envelope), content_digest(dominated.value().envelope));
+  RE_CHECK_EQ(canonical_envelope(reversed.value().envelope), canonical_envelope(dominated.value().envelope));
 }
 
 RE_TEST(merge_refuses_mutually_non_dominant_overlaps) {
