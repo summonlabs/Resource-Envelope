@@ -1,0 +1,52 @@
+# Resource Envelope -- ignore rules for C++/CMake build residue only.
+#
+# Rule of thumb: this file ignores outputs, never inputs. Sources, headers, tests, test data,
+# documentation, packaging metadata, CMakeLists.txt, and the *.cmake modules under cmake/ are
+# intentional deliverables and must stay tracked.
+
+# --- Build trees -----------------------------------------------------------
+build/
+out/
+cmake-build-*/
+.vs/
+# .vscode/ is deliberately not ignored wholesale: shared settings.json and launch.json are useful
+# and reviewable. Only editor-local residue (below) is ignored.
+
+# --- CMake residue (also catches an accidental in-source configure) --------
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+install_manifest.txt
+compile_commands.json
+# Generated configure output (*.cmake.in -> *.cmake) is always written inside the build tree, which
+# the build-tree rules above already cover. The templates under cmake/ are source: never ignore
+# *.cmake or *.cmake.in globally.
+
+# --- Compiled artifacts ----------------------------------------------------
+*.obj
+*.o
+*.a
+*.lib
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.gcda
+*.gcno
+*.dSYM/
+
+# --- Visual Studio user state ---------------------------------------------
+*.user
+*.suo
+*.sln.docstates
+
+# --- OS junk ---------------------------------------------------------------
+Thumbs.db
+.DS_Store
+desktop.ini
