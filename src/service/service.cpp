@@ -1023,6 +1023,10 @@ Result<VerifyResult> ServiceImpl::verify_authority(const VerifyInput& input) con
 
     VerifyResult verified;
     verified.verdict = verdict;
+    // The record is reported as recorded. A record written before the digest was projected onto
+    // it carries no digest of its own, so the digest is computed from the record rather than left
+    // absent: a caller verifying a decision needs to be able to name it.
+    if (!record.decision_digest.known()) record.decision_digest = compute_decision_digest(record);
     verified.record = record;
     outcome = verified;
     return Status{};
