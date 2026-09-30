@@ -4,6 +4,7 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -41,22 +42,23 @@ Result<std::uint64_t> parse_unsigned(const std::string& text, const char* what) 
   return value;
 }
 
-Result<std::int64_t> parse_signed(const std::string& text, const char* what) {
+// A signed canonical decimal quantity: an optional sign in front of the same form a declared
+// limit and a requested quantity take. A usage delta is a quantity in its dimension's own unit,
+// exactly as every other quantity on the command line is, and it is signed because a commitment
+// can be released as well as taken.
+Result<std::int64_t> parse_signed_quantity(const std::string& text, const char* what) {
   if (text.empty()) return Status(StatusCode::OutOfRange, std::string("the ") + what + " is empty");
-  bool negative = false;
-  std::size_t index = 0U;
-  if (text[0] == '-') {
-    negative = true;
-    index = 1U;
-  } else if (text[0] == '+') {
-    index = 1U;
+  const bool negative = text[0] == '-';
+  const std::string magnitude = (negative || text[0] == '+') ? text.substr(1U) : text;
+  Nanounits quantity = 0U;
+  if (magnitude.empty() || !parse_quantity(magnitude, quantity)) {
+    return Status(StatusCode::InvalidArgument,
+                  std::string("the ") + what + " is not a canonical decimal quantity");
   }
-  const Result<std::uint64_t> magnitude = parse_unsigned(text.substr(index), what);
-  if (!magnitude.ok()) return magnitude.status();
-  if (magnitude.value() > 0x7FFFFFFFFFFFFFFFULL) {
+  if (quantity > static_cast<Nanounits>(std::numeric_limits<std::int64_t>::max())) {
     return Status(StatusCode::OutOfRange, std::string("the ") + what + " exceeds the representable range");
   }
-  const std::int64_t value = static_cast<std::int64_t>(magnitude.value());
+  const std::int64_t value = static_cast<std::int64_t>(quantity);
   return negative ? -value : value;
 }
 
@@ -835,7 +837,7 @@ int command_record_usage(const Options& options) {
     delta.envelope_id = input.envelope_id;
     delta.kind = kind.value();
     if (fields.size() >= 2U && !fields[1].empty()) {
-      const Result<std::int64_t> amount = parse_signed(fields[1], "usage delta");
+      const Result<std::int64_t> amount = parse_signed_quantity(fields[1], "usage delta");
       if (!amount.ok()) { write_failure(amount.status().code(), amount.status().detail()); return kExitUsage; }
       delta.delta = amount.value();
     }

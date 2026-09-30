@@ -24,7 +24,10 @@ set(RESOURCE_ENVELOPE_TEST_SOURCES
   integration/test_service_store.cpp
   adversarial/test_hostile_inputs.cpp
   property/test_canonical_invariants.cpp
-  recovery/test_crash_recovery.cpp)
+  recovery/test_crash_recovery.cpp
+  machine/test_state_machine.cpp
+  binding/test_identity_binding.cpp
+  cli/test_cli_end_to_end.cpp)
 
 foreach(source ${RESOURCE_ENVELOPE_TEST_SOURCES})
   get_filename_component(name ${source} NAME_WE)
@@ -36,4 +39,9 @@ foreach(source ${RESOURCE_ENVELOPE_TEST_SOURCES})
   add_test(NAME ${group}.${name} COMMAND ${target})
   set_tests_properties(${group}.${name} PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 endforeach()
+
+# The command line suite drives the built tool as a child process, so it is told where that tool
+# is. The path is a generator expression, so it always names the tool from the same build tree.
+target_compile_definitions(re_test_cli_test_cli_end_to_end
+  PRIVATE RE_CLI_PATH="$<TARGET_FILE:resource-envelope>")
 

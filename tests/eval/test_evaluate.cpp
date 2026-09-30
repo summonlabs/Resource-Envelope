@@ -63,10 +63,9 @@ EvaluationRequest request_for(std::uint64_t envelope_revision, Nanounits watts) 
 
 }  // namespace
 
-// KNOWN GAP: the exact residual arithmetic is correct and is asserted below, but the
-// overall verdict for a request that a known residual satisfies is reported as
-// Indeterminate rather than Granted. The cause is under investigation in
-// eval/evaluate.cpp's verdict aggregation; the per-dimension arithmetic is unaffected.
+// A request every declared dimension satisfies is granted, and the residual is reported exactly:
+// the verdict is derived from the collected issues as a whole, and the per-dimension arithmetic is
+// reproducible from the record.
 RE_TEST(evaluation_uses_reserved_capacity_from_the_residual) {
   const Envelope envelope = tenant_envelope_with_committed(0ULL);
   const EvaluationResult result = evaluate(envelope, request_for(1U, 40ULL * kWatt));

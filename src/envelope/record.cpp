@@ -224,12 +224,11 @@ Result<DecisionRecord> decode_decision_record(std::span<const std::uint8_t> data
     return Status(reader.ok() ? StatusCode::TrailingBytes : StatusCode::TruncatedPayload,
                   "decision record did not decode exactly");
   }
-  // The recorded digest must match the digest of the record itself. A mismatch means
-  // the stored bytes and the recorded identity disagree, and the record is refused
-  // rather than trusted.
-  if (record.decision_digest.known() && compute_decision_digest(record) != record.decision_digest) {
-    return Status(StatusCode::StoreIntegrityMismatch, "decision record digest does not match its content");
-  }
+  // The digest is not carried in the payload: it is a pure function of the record, so it is
+  // restored here rather than written twice. Every reader of a decoded record - a snapshot, a
+  // journal frame, a history view, a lookup or a verification - therefore reports the digest that
+  // identifies the record, instead of a reader having to know which of them recompute it.
+  record.decision_digest = compute_decision_digest(record);
   return record;
 }
 
@@ -291,6 +290,16 @@ Digest usage_payload_digest(const UsageDelta& delta) noexcept {
   // a retry that changes the amount is recognised as a conflict.
   UsageDelta copy = delta;
   copy.idempotency_key.clear();
+  copy.sequence = 0;
+  copy.entry_id.clear();
+  copy.payload_digest = Digest::unknown();
+  return Digest(sha256_domain(kDomainIdempotency, canonical_usage_delta(copy)));
+}
+
+Digest usage_claim_digest(const UsageDelta& delta) noexcept {
+  UsageDelta copy = delta;
+  copy.idempotency_key.clear();
+  copy.envelope_revision = 0;
   copy.sequence = 0;
   copy.entry_id.clear();
   copy.payload_digest = Digest::unknown();

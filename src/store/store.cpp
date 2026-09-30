@@ -406,6 +406,15 @@ Status apply_journal_entry(StoreState& state, const JournalEntry& entry, std::ui
       value.value = current + delta.delta;
       if (delta.recorded_at > value.observed_at) value.observed_at = delta.recorded_at;
       if (!delta.source.empty()) value.source = delta.source;
+      // The claim is recorded beside the aggregate it contributed to. It is the claim as the
+      // caller stated it, so a retry after a compaction - which drops the journal - is still
+      // recognised as the same claim rather than counted a second time.
+      UsageClaim claim;
+      claim.envelope_id = delta.envelope_id;
+      claim.idempotency_key = delta.idempotency_key;
+      claim.claim_digest = usage_claim_digest(delta);
+      claim.envelope_revision = delta.envelope_revision;
+      state.usage_claims.insert(std::move(claim));
       ++state.usage_entry_count;
       if (state.usage_entry_count > kMaxUsageEntryCount) {
         return Status(StatusCode::StoreLimitExceeded, "the store holds more usage records than permitted");
@@ -478,6 +487,13 @@ Bytes canonical_store_state(const StoreState& state) {
     writer.i64(pair.second.value);
     writer.i64(pair.second.observed_at);
     writer.text(pair.second.source);
+  }
+  writer.u32(static_cast<std::uint32_t>(state.usage_claims.size()));
+  for (const UsageClaim& claim : state.usage_claims) {
+    writer.text(claim.envelope_id);
+    writer.text(claim.idempotency_key);
+    encode_digest(writer, claim.claim_digest);
+    writer.u64(claim.envelope_revision);
   }
   writer.u32(static_cast<std::uint32_t>(state.tombstones.size()));
   for (const EnvelopeTombstoneEntry& entry : state.tombstones) {
@@ -648,10 +664,30 @@ Result<DecodedSnapshot> decode_store_state(std::span<const std::uint8_t> data) {
     value.observed_at = reader.i64();
     value.source = reader.text(kProvenanceMaxLength);
     if (!reader.ok()) return Status(StatusCode::TruncatedPayload, "a stored commitment is truncated");
-    if (value.value < 0) {
-      return Status(StatusCode::StoreIntegrityMismatch, "a stored commitment aggregates below zero");
-    }
+    // A commitment is a fold over deltas and a release can take it below zero. That is
+    // recorded evidence of an over-release, not corruption, and the evaluator already refuses
+    // to interpret it as capacity. Refusing it here instead made a state the runtime had
+    // accepted impossible to load back, which is the one thing a store must never do.
     state.committed[key] = value;
+  }
+  const std::uint32_t claim_count = reader.u32();
+  if (!reader.ok() || claim_count > kMaxUsageEntryCount) {
+    return Status(StatusCode::OutOfRange, "the snapshot declares an implausible usage claim count");
+  }
+  for (std::uint32_t index = 0; index < claim_count; ++index) {
+    UsageClaim claim;
+    claim.envelope_id = reader.text(kIdentifierMaxLength);
+    claim.idempotency_key = reader.text(kIdempotencyKeyMaxLength);
+    if (!reader.ok() || !decode_digest(reader, claim.claim_digest)) {
+      return Status(StatusCode::TruncatedPayload, "a stored usage claim is truncated");
+    }
+    claim.envelope_revision = reader.u64();
+    if (!reader.ok()) return Status(StatusCode::TruncatedPayload, "a stored usage claim is truncated");
+    if (!state.usage_claims.insert(std::move(claim)).second) {
+      // The encoding is a set, so a duplicate is a malformed body rather than something to
+      // collapse silently: two identical claims are indistinguishable from a corrupted count.
+      return Status(StatusCode::StoreCorrupt, "the snapshot declares the same usage claim twice");
+    }
   }
   const std::uint32_t tombstone_count = reader.u32();
   if (!reader.ok() || tombstone_count > kMaxEnvelopeCount) {
@@ -1108,9 +1144,14 @@ Status Store::Impl::read_delta_segment(std::uint64_t epoch, StoreState& state, s
   // The manifest is the commit point, so the segment may physically hold more bytes
   // than the manifest names. Anything past the committed length is an unpublished tail
   // from an interrupted commit, and it is never read as authority.
-  const std::uint64_t committed_frames = manifest_.frames_committed - manifest_.snapshot_frames;
+  //
+  // The delta holds exactly the sequences above the one the snapshot covers, so the frame
+  // count is committed_sequence minus covered_sequence. Counting snapshot *frames* instead
+  // would be wrong for every compaction that folded more than one frame into the snapshot.
+  const std::uint64_t committed_frames = manifest_.frames_committed - manifest_.snapshot_sequence;
   std::uint64_t offset = kSegmentHeaderBytes;
   std::uint64_t frames_read = 0U;
+  std::uint64_t expected_sequence = manifest_.snapshot_sequence;
   while (frames_read < committed_frames) {
     const std::uint64_t remaining = length - offset;
     if (remaining < kFrameHeaderBytes) {
@@ -1150,6 +1191,13 @@ Status Store::Impl::read_delta_segment(std::uint64_t epoch, StoreState& state, s
     if (entry.value().sequence < baseline) {
       return Status(StatusCode::StoreCorrupt, "a delta frame carries an out-of-range sequence");
     }
+    // The journal sequence is one monotonic series dense across the snapshot and the delta,
+    // so a gap is detected here instead of being tolerated: a missing frame would otherwise
+    // be read as a shorter journal whose state digest happened not to be checked against it.
+    if (entry.value().sequence != expected_sequence + 1U) {
+      return Status(StatusCode::StoreCorrupt, "the delta segment does not continue the journal sequence");
+    }
+    expected_sequence = entry.value().sequence;
     const Status applied = apply_journal_entry(state, entry.value(), entry.value().sequence);
     if (!applied.ok()) return applied;
     state.journal.push_back(entry.value());
@@ -1176,11 +1224,17 @@ Status Store::Impl::replay_into(StoreState& state, bool& from_snapshot) {
                     "the snapshot holds a different frame count than the manifest records");
     }
     // The snapshot's own metadata must agree with the manifest that names it, so a segment
-    // and a manifest from different generations cannot be combined into one state.
+    // and a manifest from different generations cannot be combined into one state. The
+    // sequence the snapshot covers is checked against the manifest and against the state it
+    // carries, because it is what tells the reader which delta frames follow it.
     if (metadata.snapshot_epoch != manifest_.snapshot_segment ||
         metadata.compaction_count != manifest_.compaction_count) {
       return Status(StatusCode::StoreIntegrityMismatch,
                     "the snapshot metadata does not match the manifest that names it");
+    }
+    if (state.state_sequence != manifest_.snapshot_sequence) {
+      return Status(StatusCode::StoreIntegrityMismatch,
+                    "the snapshot covers a different journal sequence than the manifest records");
     }
     from_snapshot = true;
     recovery_.recovered_from_snapshot = true;
@@ -1256,18 +1310,22 @@ Status Store::Impl::refresh_total_bytes() {
 }
 
 Status Store::Impl::cut_segment_to_committed(std::uint64_t delta_epoch) {
-  const std::uint64_t committed_delta_frames = manifest_.frames_committed - manifest_.snapshot_frames;
-  const std::uint64_t epoch = delta_epoch;
-  // A committed snapshot generation accounts for every committed frame, so it has no delta to
-  // cut. Without this guard the pre-flight truncation runs against the snapshot segment itself
-  // - which the manifest names, and which therefore must never be shortened - and destroys the
-  // generation the manifest is committed to.
-  if (manifest_.snapshot_frames >= manifest_.frames_committed) {
-    if (manifest_.delta_segment == epoch) {
-      return Status(StatusCode::StoreCorrupt, "the manifest accounts for every frame inside its snapshot yet names a delta segment");
+  const std::uint64_t committed_delta_frames = manifest_.frames_committed - manifest_.snapshot_sequence;
+  // A generation whose committed sequence is entirely covered by its snapshot has no delta at
+  // all: there is nothing to cut, and the segment the manifest names as its snapshot must never
+  // be opened for writing. Without this guard the pre-flight truncation runs against the
+  // snapshot segment itself and destroys the generation the manifest is committed to.
+  if (committed_delta_frames == 0U) {
+    if (delta_epoch != 0U) {
+      return Status(StatusCode::StoreCorrupt,
+                    "the manifest accounts for every frame inside its snapshot yet names a delta segment");
     }
     return Status{};
   }
+  if (delta_epoch == 0U) {
+    return Status(StatusCode::StoreCorrupt, "the manifest commits delta frames without naming a delta segment");
+  }
+  const std::uint64_t epoch = delta_epoch;
   const std::filesystem::path path = segments_path() / segment_file_name(epoch);
   std::error_code error;
   if (!std::filesystem::exists(path, error)) {
@@ -1308,7 +1366,9 @@ Status Store::Impl::write_snapshot_segment(std::uint64_t epoch, const StoreState
                                             std::uint64_t& frames) {
   frames = 0U;
   const Bytes state_payload = canonical_store_state(state);
-  const std::uint64_t sequence = state.state_sequence == 0U ? 1U : state.state_sequence;
+  // The snapshot frame carries the sequence the snapshot covers, which is zero when the store
+  // holds no journal entries at all.
+  const std::uint64_t sequence = state.state_sequence;
   ByteWriter writer;
   writer.blob(state_payload);
   writer.u64(epoch);
@@ -1413,8 +1473,16 @@ Status Store::Impl::open() {
     // A crash between the frame writes and the manifest publication leaves frames that
     // no publication named. They are removed so the segment holds exactly the committed
     // prefix, which is what makes the next commit verifiable.
-    status = cut_segment_to_committed(manifest_.delta_segment != 0U ? manifest_.delta_segment
-                                                                    : manifest_.epoch);
+    status = cut_segment_to_committed(manifest_.delta_segment);
+    if (!status.ok()) return status;
+  }
+  if (options_.mode != OpenMode::ReadOnly && options_.remove_orphan_segments) {
+    // A segment no manifest references is never authority: it is the residue of a commit that
+    // died before it published. It is removed before anything can append to it, so no commit
+    // can write after bytes that no publication ever named - which would leave the frames the
+    // manifest counts starting at the wrong offset, and the store unreadable ever after.
+    // A read-only handle collects nothing: it mutates nothing.
+    status = collect_garbage();
     if (!status.ok()) return status;
   }
   if (options_.mode == OpenMode::ReadOnly) {
@@ -1501,25 +1569,19 @@ Status Store::Impl::write_transaction(const std::function<Status(JournalSession&
   terminate_at_commit_stage("fence");
   // Stage two: append every frame to the delta segment.
   //
-  // A store that already has an open delta appends to it. A store that has none - because it has
-  // just been opened, or because it has just been compacted - needs a segment that collides with
-  // no existing generation. On open, the commit epoch is the delta segment's own name, because
-  // the publication that preceded it named no new segment. After a compaction the commit epoch is
-  // the *snapshot* segment's name, so reusing it would truncate the snapshot the manifest still
-  // names. The two cases are told apart by whether the generation's frame budget is already
-  // accounted for by the snapshot.
+  // A generation that already names a delta appends to it, so a segment is only allocated for a
+  // generation that has none: a store that has just been created, or one whose last commit was a
+  // compaction covering every committed frame. The allocation is the commit epoch, which is
+  // strictly above the manifest epoch and therefore above every generation the manifest names.
   std::uint64_t delta_epoch = manifest_.delta_segment;
   if (delta_epoch == 0U) {
-    const std::uint64_t named_by_snapshot = manifest_.snapshot_frames;
-    if (named_by_snapshot >= manifest_.frames_committed) {
-      // Every committed frame belongs to the snapshot, so this generation has no delta yet.
-      // The next segment is allocated above every generation the manifest names.
-      delta_epoch = manifest_.epoch;
-      if (manifest_.snapshot_segment > delta_epoch) delta_epoch = manifest_.snapshot_segment;
-      ++delta_epoch;
-    } else {
-      delta_epoch = manifest_.epoch;
-    }
+    // This generation has no delta: either the store is new, or the last commit was a
+    // compaction whose snapshot covers every committed frame. The segment is allocated at the
+    // commit epoch, which is strictly above the manifest epoch and therefore above every
+    // generation the manifest names. Deriving it from the snapshot instead - as an earlier
+    // revision of this code did - names the snapshot segment itself, and appending delta
+    // frames to it makes the store unreadable.
+    delta_epoch = new_epoch;
   }
   if (!delta_open_ || delta_epoch_ != delta_epoch) {
     delta_file_ = internal::FileHandle();
@@ -1534,7 +1596,7 @@ Status Store::Impl::write_transaction(const std::function<Status(JournalSession&
       Result<internal::FileHandle> created = internal::FileHandle::create_truncate(path);
       if (!created.ok()) return created.status();
       const std::array<std::uint8_t, kSegmentHeaderBytes> header =
-          encode_segment_header(kSegmentKindDelta, delta_epoch, manifest_.snapshot_frames + 1U);
+          encode_segment_header(kSegmentKindDelta, delta_epoch, manifest_.snapshot_sequence + 1U);
       const Status written = created.value().write_at(0U, header);
       if (!written.ok()) return written;
       const Status flushed = created.value().flush();
@@ -1664,7 +1726,9 @@ Status Store::Impl::compact() {
   delta_file_ = internal::FileHandle();
   delta_open_ = false;
   ++state.compaction_count;
-  if (state.state_sequence == 0U) state.state_sequence = 1U;
+  // The journal sequence is not advanced by a compaction. It is left exactly as it was, including
+  // zero for a store that holds no records at all, because a rewrite that changed a counter would
+  // change the state commitment of a state that did not change.
   if (manifest_.epoch == kStoreEpochMax) {
     return Status(StatusCode::StoreLimitExceeded, "the store control epoch is exhausted");
   }
@@ -1679,6 +1743,7 @@ Status Store::Impl::compact() {
   next.state_epoch = new_epoch;
   next.snapshot_segment = new_epoch;
   next.snapshot_frames = frames;
+  next.snapshot_sequence = state.state_sequence;
   next.delta_segment = 0U;
   next.frames_committed = state.state_sequence;
   next.state_sequence = state.state_sequence;

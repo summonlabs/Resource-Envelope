@@ -135,10 +135,51 @@ RE_TEST(manifest_decoder_refuses_impossible_combinations) {
   manifest.state_epoch = 7U;
   manifest.snapshot_segment = 5U;
   manifest.snapshot_frames = 1U;
+  manifest.snapshot_sequence = 3U;
   manifest.frames_committed = 4U;
   manifest.state_sequence = 4U;
   const std::vector<std::uint8_t> canonical = canonical_manifest(manifest);
   RE_REQUIRE(decode_manifest(canonical).ok());
+  // The generation arithmetic is exact, so the combinations that would make it ambiguous are
+  // refused rather than interpreted: a snapshot cannot cover more than was committed, and the
+  // segment and the covered sequence must agree about whether a snapshot exists at all.
+  {
+    Manifest impossible = manifest;
+    impossible.snapshot_sequence = 5U;
+    RE_CHECK(!decode_manifest(canonical_manifest(impossible)).ok());
+  }
+  {
+    // A snapshot that covers no sequence at all is the state of a store that holds no records: the
+    // sequence is zero and the segment still holds its one frame.
+    Manifest empty_generation = manifest;
+    empty_generation.snapshot_sequence = 0U;
+    empty_generation.frames_committed = 0U;
+    empty_generation.state_sequence = 0U;
+    RE_CHECK(decode_manifest(canonical_manifest(empty_generation)).ok());
+  }
+  {
+    Manifest impossible = manifest;
+    impossible.snapshot_segment = 0U;
+    impossible.snapshot_frames = 0U;
+    RE_CHECK(!decode_manifest(canonical_manifest(impossible)).ok());
+  }
+  {
+    Manifest impossible = manifest;
+    impossible.snapshot_frames = 0U;
+    RE_CHECK(!decode_manifest(canonical_manifest(impossible)).ok());
+  }
+  {
+    // Nor may a generation claim a covered sequence without naming the snapshot that covers it.
+    Manifest impossible = manifest;
+    impossible.snapshot_segment = 0U;
+    impossible.snapshot_frames = 0U;
+    RE_CHECK(!decode_manifest(canonical_manifest(impossible)).ok());
+  }
+  {
+    Manifest impossible = manifest;
+    impossible.snapshot_segment = 9U;
+    RE_CHECK(!decode_manifest(canonical_manifest(impossible)).ok());
+  }
   const std::vector<std::uint8_t> trailing = [&canonical] {
     std::vector<std::uint8_t> copy = canonical;
     copy.push_back(0U);

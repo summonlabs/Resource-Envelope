@@ -37,9 +37,10 @@ EnvelopeView make_view(const EnvelopeEntry& entry, const EnvelopeRevisionRecord&
 
 // The exact claim a declaration or a revision makes. A retried request must produce the same
 // claim as the request it retries, so everything the store derives or that varies between
-// attempts is cleared: the revision number is derived, the supersedes pointer is written by the
-// store, and the provenance timestamp is when the attempt happened rather than what it claimed.
-// What remains is the caller's statement: scope, bindings, window and constraints.
+// attempts is cleared: the revision number is derived, the provenance timestamp is when the
+// attempt happened rather than what it claimed, and a lineage pointer names a revision this
+// claim does not carry. What remains is the caller's statement: scope, bindings, window and
+// constraints.
 Digest declaration_payload_digest(const Envelope& envelope) {
   Envelope normalized = envelope;
   normalized.revision = 0U;
@@ -268,27 +269,45 @@ const CommittedMap* committed_for(const StoreState& state, const std::string& en
   return &storage;
 }
 
-// Locates a usage claim already recorded under an idempotency key. Both the durable
-// journal and, after a compaction, the committed aggregates are consulted so a
-// replay is recognised even when the original record predates the last snapshot.
-const UsageDelta* find_recorded_delta(const StoreState& state, const std::string& envelope_id,
-                                      const std::string& idempotency_key, const Digest& payload) {
-  for (const JournalEntry& entry : state.journal) {
-    if (entry.kind != JournalEntryKind::UsageCommit || !entry.usage.has_value()) continue;
-    if (entry.usage->idempotency_key != idempotency_key) continue;
-    if (entry.usage->envelope_id != envelope_id) continue;
-    if (entry.usage->payload_digest != payload) return nullptr;
-    return &*entry.usage;
-  }
-  return nullptr;
+// Locates a usage claim already recorded under an idempotency key. The claims are part of the
+// effective state, so this is answered from the state alone and a claim accepted before a
+// compaction is recognised exactly as one accepted after it.
+const UsageClaim* find_recorded_claim(const StoreState& state, const std::string& envelope_id,
+                                      const std::string& idempotency_key, const Digest& claim) {
+  UsageClaim probe;
+  probe.envelope_id = envelope_id;
+  probe.idempotency_key = idempotency_key;
+  probe.claim_digest = claim;
+  const auto found = state.usage_claims.find(probe);
+  return found == state.usage_claims.end() ? nullptr : &*found;
 }
 
+// True when the key is already recorded against any claim. A key identifies one claim, so
+// reusing it for a different claim is a conflict rather than a second commitment.
 bool usage_key_recorded(const StoreState& state, const std::string& idempotency_key) {
-  for (const JournalEntry& entry : state.journal) {
-    if (entry.kind == JournalEntryKind::UsageCommit && entry.usage.has_value() &&
-        entry.usage->idempotency_key == idempotency_key) {
-      return true;
-    }
+  for (const UsageClaim& claim : state.usage_claims) {
+    if (claim.idempotency_key == idempotency_key) return true;
+  }
+  return false;
+}
+
+// The identity of a recorded observation as the caller stated it. The journal sequence and the
+// entry identifier are assigned by the store, and the revision is the authority the entry was
+// recorded against, so none of them can be part of a claim a retry could reproduce.
+Digest observation_claim_digest(const ObservationEntry& entry) {
+  ObservationEntry copy = entry;
+  copy.envelope_revision = 0U;
+  copy.sequence = 0U;
+  copy.entry_id.clear();
+  return Digest(sha256_domain(kDomainIdempotency, canonical_observation_entry(copy)));
+}
+
+// True when an observation carrying this claim is already recorded. Observations are recorded
+// for explainability, but recording one twice is still a defect: it inflates the store and it
+// makes the reported entry count a lie.
+bool observation_claim_recorded(const StoreState& state, const Digest& claim) {
+  for (const auto& pair : state.observations) {
+    if (observation_claim_digest(pair.second) == claim) return true;
   }
   return false;
 }
@@ -332,13 +351,31 @@ Result<EnvelopeDeclaration> ServiceImpl::declare(const DeclareInput& input) {
     const StoreState& state = session.state();
     const auto found = state.envelopes.find(envelope.id);
     if (found != state.envelopes.end() && !found->second.revisions.empty()) {
-      const EnvelopeRevisionRecord* current = current_revision_record(found->second);
-      if (current != nullptr && declaration_payload_digest(current->envelope) == payload) {
+      // Replay resolution precedes the conflict guard, and a retry is identified by the key that
+      // produced the revision: the retry is answered with that revision even when the envelope has
+      // since been revised or retired, because replay resolution precedes staleness. A declaration
+      // whose content matches the current revision is a replay too, since a declaration states
+      // constraints rather than a revision number.
+      const EnvelopeRevisionRecord* claim = nullptr;
+      const auto prior = found->second.revision_keys.find(input.idempotency_key);
+      if (prior != found->second.revision_keys.end()) {
+        const EnvelopeRevisionRecord* recorded = find_revision_record(found->second, prior->second);
+        if (recorded != nullptr && declaration_payload_digest(recorded->envelope) == payload) {
+          claim = recorded;
+        }
+      }
+      if (claim == nullptr) {
+        const EnvelopeRevisionRecord* current = current_revision_record(found->second);
+        if (current != nullptr && declaration_payload_digest(current->envelope) == payload) {
+          claim = current;
+        }
+      }
+      if (claim != nullptr) {
         EnvelopeDeclaration replayed;
-        replayed.envelope_id = current->envelope.id;
-        replayed.revision = current->envelope.revision;
-        replayed.record_digest = current->record_digest;
-        replayed.content_digest = current->content_digest;
+        replayed.envelope_id = claim->envelope.id;
+        replayed.revision = claim->envelope.revision;
+        replayed.record_digest = claim->record_digest;
+        replayed.content_digest = claim->content_digest;
         replayed.control_epoch = store_->control_epoch();
         replayed.replayed = true;
         result = replayed;
@@ -407,23 +444,11 @@ Result<EnvelopeRevision> ServiceImpl::revise(const ReviseInput& input) {
       failure = Status(StatusCode::EnvelopeNotFound, "no envelope with this identifier exists");
       return failure;
     }
-    if (found->second.tombstoned) {
-      failure = Status(StatusCode::EnvelopeNotFound, "the envelope has been retired and cannot be revised");
-      return failure;
-    }
-    const EnvelopeRevisionRecord* current = current_revision_record(found->second);
-    if (current == nullptr) {
-      failure = Status(StatusCode::EnvelopeNotCurrent, "the envelope has no current revision");
-      return failure;
-    }
-    // The previous revision is copied before anything is staged. Staging appends to the
-    // revision vector, which can reallocate it and invalidate a pointer into it.
-    const std::uint64_t previous_revision = current->envelope.revision;
-    const Digest previous_digest = current->record_digest;
-    // Replay resolution runs before every freshness check, because the whole point of the check
-    // is to make a lost response safe to retry after the authority has moved. The key is what
-    // identifies the retry: the revision number the first attempt produced is derived from the
-    // authority at that time and cannot be reconstructed from the request.
+    // Replay resolution runs before every freshness check, including retirement, because the
+    // whole point of the check is to make a lost response safe to retry after the authority has
+    // moved. The key is what identifies the retry: the revision number the first attempt
+    // produced is derived from the authority at that time and cannot be reconstructed from the
+    // request. A retired envelope therefore still answers a retry with the revision it created.
     const auto prior = found->second.revision_keys.find(input.idempotency_key);
     if (prior != found->second.revision_keys.end()) {
       const EnvelopeRevisionRecord* existing = find_revision_record(found->second, prior->second);
@@ -451,6 +476,19 @@ Result<EnvelopeRevision> ServiceImpl::revise(const ReviseInput& input) {
                         "this idempotency key is already recorded against a different revision claim");
       return failure;
     }
+    if (found->second.tombstoned) {
+      failure = Status(StatusCode::EnvelopeNotFound, "the envelope has been retired and cannot be revised");
+      return failure;
+    }
+    const EnvelopeRevisionRecord* current = current_revision_record(found->second);
+    if (current == nullptr) {
+      failure = Status(StatusCode::EnvelopeNotCurrent, "the envelope has no current revision");
+      return failure;
+    }
+    // The previous revision is copied before anything is staged. Staging appends to the
+    // revision vector, which can reallocate it and invalidate a pointer into it.
+    const std::uint64_t previous_revision = current->envelope.revision;
+    const Digest previous_digest = current->record_digest;
     Envelope candidate = envelope;
     candidate.revision = previous_revision + 1U;
     const Digest requested_payload = declaration_payload_digest(candidate);
@@ -463,7 +501,11 @@ Result<EnvelopeRevision> ServiceImpl::revise(const ReviseInput& input) {
       failure = Status(StatusCode::StaleRevision, "the expected current digest is not the current digest");
       return failure;
     }
-    candidate.supersedes = envelope.id;
+    // The supersedes pointer is not derived. It is a claim about another envelope, and the
+    // evaluation of a revision refuses a pointer that names the envelope making it, so writing
+    // the envelope's own identifier here made every revised envelope unevaluable. A caller that
+    // states a lineage keeps it, exactly as on a declaration; a revision is identified by its
+    // revision number and its lineage by its identifier.
     candidate.provenance.declared_at = input.requested_at;
     const Status shape = validate_envelope_shape(candidate);
     if (!shape.ok()) {
@@ -518,10 +560,37 @@ Result<AuthorizeResult> ServiceImpl::authorize(const EvaluationRequest& request)
     std::uint64_t stored_sequence = 0U;
     const Status resolved = resolve_targets(state, request, envelope, is_current, facility, stored_sequence);
 
+    // A replay is reported from the record it produced, never re-decided against an authority
+    // that may since have moved.
+    const auto report_replay = [&](const DecisionRecord& existing) {
+      AuthorizeResult replayed;
+      replayed.record = existing;
+      // The digest is the recorded one when the record carries it, and is otherwise
+      // recomputed from the record, so a replay always reports the same value the original
+      // decision reported rather than an absent digest.
+      replayed.decision_digest = existing.decision_digest.known()
+                                     ? existing.decision_digest
+                                     : compute_decision_digest(existing);
+      replayed.record.decision_digest = replayed.decision_digest;
+      replayed.replayed = true;
+      replayed.evaluation.outcome = existing.outcome;
+      replayed.evaluation.reason = existing.reason;
+      replayed.evaluation.stage = existing.stage;
+      replayed.evaluation.blocking_dimension = existing.blocking_dimension;
+      replayed.evaluation.decision_digest = replayed.decision_digest;
+      replayed.evaluation.decision_sequence = existing.sequence;
+      replayed.evaluation.envelope_id = existing.envelope_id;
+      replayed.evaluation.envelope_revision = existing.envelope_revision;
+      replayed.evaluation.envelope_digest = existing.envelope_digest;
+      replayed.evaluation.control_epoch = existing.control_epoch;
+      replayed.evaluation.request_digest = existing.request_digest;
+      replayed.evaluation.evidence_digest = existing.evidence_digest;
+      replayed.evaluation.dimensions = existing.dimensions;
+      replayed.evaluation.secondary = existing.secondary;
+      result = replayed;
+    };
+
     if (resolved.ok()) {
-      // Replay resolution is attempted before the evaluation runs, so a lost response
-      // is resolved from the recorded decision rather than re-decided against an
-      // authority that may since have moved.
       StatusCode conflict = StatusCode::Ok;
       const DecisionRecord* existing =
           latest_decision_for(state, envelope->id, request.idempotency_key, request_fingerprint, conflict);
@@ -529,31 +598,31 @@ Result<AuthorizeResult> ServiceImpl::authorize(const EvaluationRequest& request)
         return Status(conflict, "this idempotency key is already recorded against a different request");
       }
       if (existing != nullptr) {
-        AuthorizeResult replayed;
-        replayed.record = *existing;
-        // The digest is the recorded one when the record carries it, and is otherwise
-        // recomputed from the record, so a replay always reports the same value the original
-        // decision reported rather than an absent digest.
-        replayed.decision_digest = existing->decision_digest.known()
-                                       ? existing->decision_digest
-                                       : compute_decision_digest(*existing);
-        replayed.record.decision_digest = replayed.decision_digest;
-        replayed.replayed = true;
-        replayed.evaluation.outcome = existing->outcome;
-        replayed.evaluation.reason = existing->reason;
-        replayed.evaluation.stage = existing->stage;
-        replayed.evaluation.blocking_dimension = existing->blocking_dimension;
-        replayed.evaluation.decision_digest = replayed.decision_digest;
-        replayed.evaluation.decision_sequence = existing->sequence;
-        replayed.evaluation.envelope_id = existing->envelope_id;
-        replayed.evaluation.envelope_revision = existing->envelope_revision;
-        replayed.evaluation.envelope_digest = existing->envelope_digest;
-        replayed.evaluation.control_epoch = existing->control_epoch;
-        replayed.evaluation.request_digest = existing->request_digest;
-        replayed.evaluation.evidence_digest = existing->evidence_digest;
-        replayed.evaluation.dimensions = existing->dimensions;
-        replayed.evaluation.secondary = existing->secondary;
-        result = replayed;
+        report_replay(*existing);
+        return Status{};
+      }
+    } else {
+      // The authority cannot be resolved any more: it was retired, or a second envelope now
+      // claims the same scope. A retry of a request that was already decided is still answered
+      // from its record, because replay resolution precedes staleness - retirement is a change
+      // to the authority, not a reason for a caller to lose the answer it never received. The
+      // recorded request digest covers the scope, so a match identifies the caller's claim
+      // exactly; two recorded determinations under one claim are ambiguous and are refused
+      // rather than resolved by a choice the caller cannot see.
+      const DecisionRecord* recorded = nullptr;
+      std::size_t matches = 0U;
+      for (const DecisionRecord& candidate : state.decisions) {
+        if (candidate.idempotency_key != request.idempotency_key) continue;
+        if (candidate.request_digest != request_fingerprint) continue;
+        ++matches;
+        if (recorded == nullptr || recorded->sequence < candidate.sequence) recorded = &candidate;
+      }
+      if (matches > 1U) {
+        return Status(StatusCode::IdempotencyConflict,
+                      "this idempotency key is recorded against more than one determination");
+      }
+      if (recorded != nullptr) {
+        report_replay(*recorded);
         return Status{};
       }
     }
@@ -575,7 +644,11 @@ Result<AuthorizeResult> ServiceImpl::authorize(const EvaluationRequest& request)
       context.authority_state_digest = authority_digest;
       context.decision_sequence = decision_sequence;
       evaluation = evaluate_with_context(context, request);
-      if (evaluation.reason == StatusCode::Ok) {
+      // The resolution failure is the reason, and it is reported rather than overwritten by the
+      // generic "no envelope" the context-only evaluation records. An ambiguous scope is the case
+      // that matters: two current envelopes claiming one scope must be reported as an ambiguous
+      // authority, not as an absent one, or the operator is told to create what already exists.
+      if (evaluation.reason == StatusCode::Ok || evaluation.reason == StatusCode::EnvelopeNotFound) {
         evaluation.outcome = Outcome::Denied;
         evaluation.reason = resolved.code();
         evaluation.stage = RefusalStage::EnvelopePresence;
@@ -639,52 +712,54 @@ Result<ObservationResult> ServiceImpl::record_observation(const ObservationInput
   const Status status = store_->with_writer([&](JournalSession& session) {
     const StoreState& state = session.state();
     const auto found = state.envelopes.find(input.envelope_id);
-    if (found == state.envelopes.end() || found->second.tombstoned) {
-      return Status(StatusCode::EnvelopeNotFound, "no envelope with this identifier is current");
-    }
-    const EnvelopeRevisionRecord* current = current_revision_record(found->second);
-    if (current == nullptr) {
-      return Status(StatusCode::EnvelopeNotCurrent, "the envelope has no current revision");
-    }
-    if (input.expected_envelope_revision.has_value() &&
-        *input.expected_envelope_revision != current->envelope.revision) {
-      return Status(StatusCode::StaleRevision, "the expected envelope revision is not the current revision");
+    if (found == state.envelopes.end()) {
+      return Status(StatusCode::EnvelopeNotFound, "no envelope with this identifier exists");
     }
 
-    std::vector<ObservationEntry> staged;
+    // Replay resolution first, on the claim the caller stated: an observation already recorded
+    // is not recorded again, whether or not the authority it was recorded against is still
+    // current, and the sequence and entry the store assigned to the original are not part of
+    // the claim a retry has to reproduce.
+    std::vector<ObservationEntry> appended;
     std::uint64_t replayed = 0U;
     for (const ObservationEntry& original : input.entries) {
       ObservationEntry entry = original;
       entry.envelope_id = input.envelope_id;
-      entry.envelope_revision = current->envelope.revision;
-      if (entry.observed_at == 0) entry.observed_at = original.observed_at;
-      const Digest payload = Digest(sha256_domain(
-          kDomainIdempotency, canonical_observation_entry(entry)));
-      bool already = false;
-      for (auto iterator = state.observations.begin(); iterator != state.observations.end(); ++iterator) {
-        const Digest existing_payload = Digest(sha256_domain(
-            kDomainIdempotency, canonical_observation_entry(iterator->second)));
-        if (existing_payload == payload) {
-          already = true;
-          break;
-        }
-      }
-      if (already) {
+      const Digest claim = observation_claim_digest(entry);
+      if (observation_claim_recorded(state, claim)) {
         ++replayed;
-        staged.push_back(entry);
         continue;
       }
-      entry.sequence = session.next_sequence();
-      entry.entry_id = "observation-" + to_hex(entry.sequence);
-      session.stage_observation(entry);
-      staged.push_back(entry);
+      appended.push_back(std::move(entry));
+    }
+
+    if (!appended.empty()) {
+      if (found->second.tombstoned) {
+        return Status(StatusCode::EnvelopeNotFound,
+                      "the envelope has been retired and cannot accept new observations");
+      }
+      const EnvelopeRevisionRecord* current = current_revision_record(found->second);
+      if (current == nullptr) {
+        return Status(StatusCode::EnvelopeNotCurrent, "the envelope has no current revision");
+      }
+      if (input.expected_envelope_revision.has_value() &&
+          *input.expected_envelope_revision != current->envelope.revision) {
+        return Status(StatusCode::StaleRevision,
+                      "the expected envelope revision is not the current revision");
+      }
+      for (ObservationEntry& entry : appended) {
+        entry.envelope_revision = current->envelope.revision;
+        entry.sequence = session.next_sequence();
+        entry.entry_id = "observation-" + to_hex(entry.sequence);
+        session.stage_observation(entry);
+      }
     }
 
     ObservationResult recorded;
     recorded.envelope_id = input.envelope_id;
-    recorded.stored = staged.size() - replayed;
+    recorded.stored = appended.size();
     recorded.replayed = replayed;
-    recorded.entries_digest = observation_entries_digest(staged);
+    recorded.entries_digest = observation_entries_digest(appended);
     recorded.last_sequence = session.next_sequence() - 1U;
     result = recorded;
     return Status{};
@@ -813,25 +888,28 @@ Result<UsageResult> ServiceImpl::record_usage(const UsageInput& input) {
   const Status status = store_->with_writer([&](JournalSession& session) {
     const StoreState& state = session.state();
     const auto found = state.envelopes.find(input.envelope_id);
-    if (found == state.envelopes.end() || found->second.tombstoned) {
-      return Status(StatusCode::EnvelopeNotFound, "no envelope with this identifier is current");
-    }
-    const EnvelopeRevisionRecord* current = current_revision_record(found->second);
-    if (current == nullptr) {
-      return Status(StatusCode::EnvelopeNotCurrent, "the envelope has no current revision");
+    if (found == state.envelopes.end()) {
+      return Status(StatusCode::EnvelopeNotFound, "no envelope with this identifier exists");
     }
 
-    // Replay resolution first: a lost response must not double-count a delta.
+    // Replay resolution runs first, before every freshness check and before the retirement
+    // guard: a claim that has already been accepted is answered from the record of its
+    // acceptance, so a lost response stays retryable after the authority has been revised or
+    // retired. The claim is matched on what the caller stated, so a revision between the
+    // attempt and the retry does not turn a replay into a conflict.
     std::vector<UsageDelta> appended;
-    std::vector<UsageDelta> replayed;
+    std::uint64_t replayed = 0U;
+    std::uint64_t replayed_revision = 0U;
     for (const UsageDelta& original : input.deltas) {
       UsageDelta delta = original;
-      delta.envelope_revision = current->envelope.revision;
+      delta.envelope_id = input.envelope_id;
       delta.recorded_at = input.requested_at;
-      const Digest payload = usage_payload_digest(delta);
-      const UsageDelta* recorded = find_recorded_delta(state, input.envelope_id, input.idempotency_key, payload);
+      const Digest claim = usage_claim_digest(delta);
+      const UsageClaim* recorded =
+          find_recorded_claim(state, input.envelope_id, input.idempotency_key, claim);
       if (recorded != nullptr) {
-        replayed.push_back(*recorded);
+        ++replayed;
+        replayed_revision = recorded->envelope_revision;
         continue;
       }
       if (usage_key_recorded(state, input.idempotency_key)) {
@@ -839,13 +917,31 @@ Result<UsageResult> ServiceImpl::record_usage(const UsageInput& input) {
                       "this idempotency key is already recorded against a different usage claim");
       }
       delta.idempotency_key = input.idempotency_key;
-      delta.payload_digest = payload;
       appended.push_back(std::move(delta));
     }
 
-    if (!appended.empty() && input.expected_envelope_revision.has_value() &&
-        *input.expected_envelope_revision != current->envelope.revision) {
-      return Status(StatusCode::StaleRevision, "the expected envelope revision is not the current revision");
+    // Only a claim that is not already recorded needs the authority to be current. A pure
+    // replay is answerable whatever has since happened to the envelope.
+    std::uint64_t stored_revision = replayed_revision;
+    if (!appended.empty()) {
+      if (found->second.tombstoned) {
+        return Status(StatusCode::EnvelopeNotFound,
+                      "the envelope has been retired and cannot accept new commitments");
+      }
+      const EnvelopeRevisionRecord* current = current_revision_record(found->second);
+      if (current == nullptr) {
+        return Status(StatusCode::EnvelopeNotCurrent, "the envelope has no current revision");
+      }
+      if (input.expected_envelope_revision.has_value() &&
+          *input.expected_envelope_revision != current->envelope.revision) {
+        return Status(StatusCode::StaleRevision,
+                      "the expected envelope revision is not the current revision");
+      }
+      stored_revision = current->envelope.revision;
+      for (UsageDelta& delta : appended) {
+        delta.envelope_revision = current->envelope.revision;
+        delta.payload_digest = usage_payload_digest(delta);
+      }
     }
 
     const std::uint64_t first_sequence = appended.empty() ? 0U : session.next_sequence();
@@ -857,9 +953,9 @@ Result<UsageResult> ServiceImpl::record_usage(const UsageInput& input) {
 
     UsageResult recorded;
     recorded.envelope_id = input.envelope_id;
-    recorded.envelope_revision = current->envelope.revision;
+    recorded.envelope_revision = stored_revision;
     recorded.entries_appended = appended.size();
-    recorded.entries_replayed = replayed.size();
+    recorded.entries_replayed = replayed;
     recorded.entries_digest = usage_entries_digest(appended);
     recorded.first_sequence = first_sequence;
     recorded.last_sequence = session.next_sequence() - 1U;
@@ -1008,6 +1104,14 @@ Result<VerifyResult> ServiceImpl::verify_authority(const VerifyInput& input) con
                      input.identity->identity != current->envelope.scope.identity) {
             verdict.state = AuthorityState::IdentityBindingChanged;
             verdict.detail = "the supplied identity generation is not the generation the envelope is bound to";
+          } else if (input.identity.has_value() && current->envelope.identity_digest.known() &&
+                     input.identity->digest != current->envelope.identity_digest) {
+            // The identity an envelope binds to is an identifier *and* a digest of the record
+            // the owning authority publishes. A caller that reports a different digest is
+            // reporting that the bound identity record has changed, which invalidates the
+            // determination exactly as a changed generation does.
+            verdict.state = AuthorityState::IdentityBindingChanged;
+            verdict.detail = "the supplied identity digest is not the digest the envelope is bound to";
           } else if ((input.service_class.has_value() && input.service_class->state == ResolutionState::Provided &&
                       current->envelope.service_class_digest.known() &&
                       input.service_class->digest != current->envelope.service_class_digest) ||
@@ -1201,7 +1305,11 @@ Result<EvaluationResult> ServiceImpl::evaluate(const EvaluationRequest& request)
       context.control_epoch = control_epoch;
       context.authority_state_digest = authority_digest;
       outcome = evaluate_with_context(context, request);
-      if (outcome.reason == StatusCode::Ok) {
+      // The resolution failure is the reason, and it is reported rather than overwritten by the
+      // generic "no envelope" the context-only evaluation records. An ambiguous scope is the case
+      // that matters: two current envelopes claiming one scope must be reported as an ambiguous
+      // authority, not as an absent one, or the operator is told to create what already exists.
+      if (outcome.reason == StatusCode::Ok || outcome.reason == StatusCode::EnvelopeNotFound) {
         outcome.outcome = Outcome::Denied;
         outcome.reason = resolved.code();
         outcome.stage = RefusalStage::EnvelopePresence;

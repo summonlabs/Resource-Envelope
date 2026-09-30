@@ -40,6 +40,7 @@ const std::vector<std::string>& known_options() {
       "expected-revision",
       "expected-digest",
       "decision",
+      "revision",
       "limit",
       "principal",
       "principal-generation",
@@ -104,6 +105,7 @@ const char* kUsage =
     "  --actor <token>              declaring actor\n"
     "  --reason <text>              declaration reason\n"
     "  --id <id>                    envelope identifier (declare and revise)\n"
+    "  --revision <n>               retained revision to print (show-revision)\n"
     "  --effective-from <rfc3339>   window start\n"
     "  --effective-until <rfc3339>  window end\n"
     "  --precedence <list>          comma-separated dimension precedence\n"

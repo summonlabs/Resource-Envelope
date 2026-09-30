@@ -15,6 +15,7 @@ void encode_manifest_body(ByteWriter& writer, const Manifest& manifest) {
   writer.u64(manifest.frames_committed);
   writer.u64(manifest.state_sequence);
   writer.u64(manifest.snapshot_frames);
+  writer.u64(manifest.snapshot_sequence);
   encode_digest(writer, manifest.state_digest);
   encode_digest(writer, manifest.chain_digest);
   writer.u64(manifest.envelope_count);
@@ -67,6 +68,7 @@ Result<Manifest> decode_manifest(std::span<const std::uint8_t> data) {
   manifest.frames_committed = reader.u64();
   manifest.state_sequence = reader.u64();
   manifest.snapshot_frames = reader.u64();
+  manifest.snapshot_sequence = reader.u64();
   if (!reader.ok()) return Status(StatusCode::TruncatedPayload, "manifest header is truncated");
   if (!decode_digest(reader, manifest.state_digest)) {
     return Status(StatusCode::TruncatedPayload, "manifest state digest is truncated");
@@ -88,8 +90,22 @@ Result<Manifest> decode_manifest(std::span<const std::uint8_t> data) {
   if (manifest.state_epoch > manifest.epoch) {
     return Status(StatusCode::StoreCorrupt, "manifest state epoch is ahead of its control epoch");
   }
-  if (manifest.snapshot_frames > manifest.frames_committed) {
-    return Status(StatusCode::StoreCorrupt, "manifest snapshot length exceeds its committed length");
+  // The snapshot's frame count is a physical count of the frames in that one segment, and the
+  // committed length is a journal sequence: a compacted store that holds no records has one
+  // snapshot frame and a committed sequence of zero, which is not a contradiction.
+  if (manifest.snapshot_sequence > manifest.frames_committed) {
+    // The sequences a snapshot covers are a prefix of the committed sequence, so a snapshot
+    // that claims to cover more than was committed names frames nothing published.
+    return Status(StatusCode::StoreCorrupt, "manifest snapshot sequence exceeds its committed sequence");
+  }
+  const bool names_snapshot = manifest.snapshot_segment != 0U;
+  if (names_snapshot != (manifest.snapshot_frames != 0U)) {
+    return Status(StatusCode::StoreCorrupt,
+                  "manifest snapshot segment and frame count disagree about whether a snapshot exists");
+  }
+  if (!names_snapshot && manifest.snapshot_sequence != 0U) {
+    // A generation with no snapshot covers no sequence: its delta holds every committed frame.
+    return Status(StatusCode::StoreCorrupt, "manifest covers a snapshot sequence without naming a snapshot");
   }
   if (manifest.snapshot_segment != 0U && manifest.snapshot_segment > manifest.epoch) {
     return Status(StatusCode::StoreCorrupt, "manifest names a snapshot segment from a future epoch");

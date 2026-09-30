@@ -137,6 +137,13 @@ struct RESOURCE_ENVELOPE_API UsageDelta {
 RESOURCE_ENVELOPE_API Bytes canonical_usage_delta(const UsageDelta& delta);
 RESOURCE_ENVELOPE_API Result<UsageDelta> decode_usage_delta(std::span<const std::uint8_t> data);
 RESOURCE_ENVELOPE_API Digest usage_payload_digest(const UsageDelta& delta) noexcept;
+// The identity of a usage claim as the caller stated it: the envelope, the dimension, the
+// amount, the principal, the compatibility class, the source and the claimed timestamp.
+// Every value the store derives or assigns is excluded - the revision the claim is recorded
+// against, the journal sequence, the entry identifier and the recorded payload digest - so a
+// retry of the same claim is the same claim even after the authority has advanced, while a
+// retry that changes the amount is a different one.
+RESOURCE_ENVELOPE_API Digest usage_claim_digest(const UsageDelta& delta) noexcept;
 
 // Observed measurements are recorded for explainability and trend reporting only.
 // They are never an input to admission arithmetic and never become committed usage.

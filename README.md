@@ -183,8 +183,12 @@ revision.
 
 Binding confirmation is explicit. An envelope with `require_binding_confirmation` set refuses
 evaluation unless the caller supplies the identity digest it is bound to; an absent
-confirmation is never read as agreement. An operator that has not yet wired an identity
-authority declares the envelope with `--require-identity-binding false`.
+confirmation is never read as agreement, and a supplied digest that differs from the binding is
+refused at the same stage, before any arithmetic runs. An operator that has not yet wired an
+identity authority declares the envelope with `--require-identity-binding false`, which waives the
+requirement for an absent snapshot and nothing else: a wrong digest is still compared and refused.
+Verification re-checks the same binding, so a caller that reports a different generation **or** a
+different digest for the identity a determination was bound to is told `IdentityBindingChanged`.
 
 Nothing in the runtime caches authority between calls. The service loads state, decides and
 publishes inside one call, so a restart has no live authority to preserve and no stale
@@ -197,9 +201,11 @@ An envelope identifier names a lineage; a revision is one immutable member of it
 1. **Declared** - revision 1 is created. A repeated declaration with the same idempotency key
    and payload digest is resolved as a replay and returns the original revision without
    advancing authority. A declaration that differs from an existing identifier is refused.
-2. **Revised** - the current revision advances by exactly one. The new revision carries the
-   previous identifier in `supersedes` and a fresh digest. An expected current revision or
-   digest that does not match is refused with `StaleRevision`.
+2. **Revised** - the current revision advances by exactly one and carries a fresh digest. A
+   revision is a member of the same lineage, so it carries no `supersedes` pointer: that pointer
+   names another envelope, and a pointer naming the envelope that makes it is a self-reference and
+   is refused at evaluation. An expected current revision or digest that does not match is refused
+   with `StaleRevision`.
 3. **Retained** - superseded revisions are retained so a decision recorded against one stays
    explainable. Retention is bounded by `kMaxRetainedRevisionsPerEnvelope` (64); a decision
    naming a revision that retention has dropped is reported `EnvelopeMissing` and is never
@@ -278,11 +284,31 @@ Rollback detection is bounded by the stated threat model: it defeats accidental 
 partial copies, not an adversary who can rewrite the fence, the manifest and the segments
 together.
 
+### Durable format version
+
+`kStoreLayoutVersion` is 2. Layout 2 records the journal sequence a snapshot covers, so the delta
+frames of a compacted generation are counted exactly, and carries accepted usage claims in the
+canonical state, so an idempotent usage retry is recognised after a compaction. A store written
+under layout 1 is refused with `UnsupportedVersion`: the two layouts cannot be told apart by
+inspection, and a store that cannot be read exactly is refused rather than interpreted. The frame
+and segment wire format (`kStoreFormatVersion`) is unchanged, and no caller-visible API changed
+shape.
+
 ### Compaction
 
 Compaction writes the live state into a fresh snapshot segment, flushes it, reads it back,
 verifies it, publishes a manifest that names it, and only then removes superseded segments. A
 snapshot segment contains exactly one frame whose payload is the canonical effective state.
+
+The manifest records the journal sequence the snapshot covers, not merely the number of frames it
+holds: a snapshot folds an arbitrary number of frames into one, so the delta frames of a generation
+are the sequences above that covered sequence. A generation whose snapshot covers everything
+committed has no delta, and the next commit allocates a segment above every generation the manifest
+names rather than reusing the snapshot's own name. Compaction therefore changes nothing a reader
+can observe: the state digest, the journal sequence and the control counters are identical before
+and after it, including for a store that holds no records at all. A segment that no manifest
+references is never authority: it is the residue of a commit that died before it published, and it
+is removed when the store is next opened for writing, before anything can append to it.
 
 ## Concurrency model
 
@@ -339,7 +365,7 @@ first, so digests for different purposes can never be confused even over identic
 | Request digest | scope, idempotency key, timestamp, expected revision and digest, binding resolutions, accepted classes, requested dimensions, composition | evidence set |
 | Evidence digest | the evidence set, ordered canonically | - |
 | Decision digest | the whole decision record with its own digest field cleared | that field |
-| State digest | envelopes, decisions, observations, commitments, retirements, counters | the journal |
+| State digest | envelopes, decisions, observations, commitments, retirements, accepted usage claims, counters | the journal |
 | Frame digest | the exact frame payload bytes | - |
 
 ## Error and refusal semantics
@@ -471,13 +497,16 @@ All results below were produced on this host. Nothing is extrapolated.
 | --- | --- |
 | Debug build, MSVC `/W4 /WX /permissive- /std:c++20 /GR- /guard:cf` | clean, zero warnings |
 | Release build, same policy | clean, zero warnings |
-| Debug test suite | 9 of 9 suites pass, 0 failures |
-| Release test suite | 9 of 9 suites pass, 0 failures |
-| Command line tool | declaration and replay of a declaration, usage recording, evaluation, statistics and schema verified by hand against a real store directory |
+| Debug test suite | 12 of 12 suites pass, 0 failures, 70 870 checks |
+| Release test suite | 12 of 12 suites pass, 0 failures, 70 870 checks |
+| Randomized state machine | 480 steps over two seeds against live stores, 65 205 checks, 0 failures; the same seed reproduces the same state digest in a different store |
+| Identity binding | 206 checks over tenant, service and facility scopes: a matching generation and digest succeeds, a stale generation, a stale digest, a foreign identity or an absent confirmation fails with `GenerationBinding`, and a restart or a replay cannot bypass the binding |
+| Command line tool | declaration and replay of a declaration, usage recording including a release, observation recording and replay, evaluation, authorisation, verification, history, compaction, a retained revision, retirement and statistics, verified by hand against a real store directory and then pinned by `cli.test_cli_end_to_end`, which drives the built tool as a child process over that same surface |
 | Decoder corruption sweeps | every truncation prefix and every single-byte flip of the envelope, decision-record, usage-delta and journal-entry encodings |
-| Crash recovery | a real process killed at each of the four commit-stage boundaries, then reopened; a partial publication never becomes visible |
+| Crash recovery | a real process killed at each of the four commit-stage boundaries, then reopened; a partial publication never becomes visible; a process killed inside the very first commit of a new store leaves a store the next commit can use |
 | Cross-process exclusion | a second writer refused while another process holds the store; a killed holder does not leave the store locked |
-| Property validation | more than 300 generated cases per property from a fixed seed, over canonical encoding, digest invariance, evaluation monotonicity and replay exactness |
+| Property validation | more than 300 generated cases per property from a fixed seed, over canonical encoding, digest invariance, evaluation monotonicity and replay exactness, 4 578 checks |
+| Durable format | store layout version 2; a store written under layout 1 is refused with `UnsupportedVersion` rather than misinterpreted |
 | Downstream consumer | configured, built and executed against the installed prefix only, through `find_package` |
 | Fresh clone | the committed revision cloned into an empty directory, configured, built and tested from a clean tree |
 | Sanitizers | **not available.** The validated toolchain is MSVC, which provides no AddressSanitizer for this configuration; `RESOURCE_ENVELOPE_ENABLE_SANITIZERS=ON` reports that fact rather than fabricating a claim. The strongest available alternative is used: every non-Release configuration compiles with `_ITERATOR_DEBUG_LEVEL=2` and MSVC runtime checks. |
@@ -491,10 +520,13 @@ All results below were produced on this host. Nothing is extrapolated.
 | `core.test_text` | UTF-8 validation (overlong, surrogate, out-of-range, truncated, embedded NUL), identifier defects, Windows reserved device names, splitting and trimming |
 | `core.test_time` | RFC 3339 parse and format round trips, malformed and out-of-range timestamps, numeric offsets normalised to UTC, leap years, half-open window boundaries, saturating addition |
 | `eval.test_evaluate` | reserved capacity in the residual, unknown versus zero committed usage, over-commitment reporting, undeclared dimensions, unknown bounds, quantization refusal, expiry and window boundaries, scope mismatch, revision fencing, redundancy without an operational spare, exclusive dimension without an evidenced holder, refusal precedence, digest determinism, envelope encoding round trips and corruption, merge dominance and ambiguity |
-| `integration.test_service_store` | durable round trip with a stable digest across reopen, idempotent declaration and authorisation replay, idempotency conflict, revision advance and fencing, authority verification states, usage folding and replay without double counting, compaction, retirement, truncation detection, read-only refusal, hostile identifiers |
+| `integration.test_service_store` | durable round trip with a stable digest across reopen, idempotent declaration and authorisation replay, idempotency conflict, revision advance and fencing, authority verification states, usage folding and replay without double counting, compaction, retirement, truncation detection, read-only refusal, hostile identifiers, and the focused regression cases for the defects listed below: a revised envelope that still evaluates, compaction followed by continued mutation, compacting an empty store, usage replay across compaction, revision and retirement, observation replay, every operation answered from its record after a retirement, a commitment released below zero, an ambiguous scope, and the digest of a recorded decision |
 | `adversarial.test_hostile_inputs` | every decoder fed every truncation prefix and every single-byte flip, impossible manifest combinations, absurd declared sizes, hostile identifiers, generated segment names, the published CRC-32 check value |
 | `property.test_canonical_invariants` | canonical encoding is total, injective and a fixed point after one pass; content and record digests do not depend on dimension or lineage declaration order; evaluation is total, deterministic and monotone in the requested quantity; tightening a limit never turns a refusal into a grant; declarations and authorisations replay bit for bit and append nothing |
-| `recovery.test_crash_recovery` | a process killed at the fence, frame, verification and publication boundaries; an interrupted publication is never visible; a second writer is refused across processes; a reader is never admitted alongside a writer; a killed holder does not leave the store locked |
+| `recovery.test_crash_recovery` | a process killed at the fence, frame, verification and publication boundaries; an interrupted publication is never visible; a process killed inside the first commit of a new store leaves a store whose next commit is admitted, whose orphaned segment is never read as authority and whose subsequent reopen agrees; a second writer is refused across processes; a reader is never admitted alongside a writer; a killed holder does not leave the store locked |
+| `machine.test_state_machine` | a seeded randomized sequence of declarations, revisions, retirements, usage records, observations, authorisations, verifications, compactions, restarts and reads against live stores, with ten core invariants checked after every step against a reference model: envelope lifecycle and revision monotonicity, idempotent replay before staleness, generation and control-epoch fencing, exact residual arithmetic, unknown never becoming zero or permitted, retire/revise/reopen semantics, durable restart equivalence, compaction followed by continued mutation, canonical digest stability and declaration-order independence, and no authority duplication |
+| `cli.test_cli_end_to_end` | the built command line tool driven as a child process against a real store directory: the units every quantity is expressed in (a declared limit, a requested quantity, an observed value and a signed usage delta), usage and observation replay, the exact residual and headroom the tool reports, an unconfirmed binding refused at the generation stage, a recorded decision read back and verified with the digest that identifies it, a usage replay after a compaction, a retained revision printed by `show-revision`, retirement, and a malformed quantity refused before anything is written |
+| `binding.test_identity_binding` | the identity-binding path for tenant, service and facility scopes: matching generation and digest confirmed, stale generation, stale digest, foreign identity, absent confirmation and digest-without-identifier each refused with the designed stage and reason, a waived binding waived and nothing else, service-class and policy digests checked the same way, the binding recorded in the decision, verification reporting a changed generation or digest, and a restart or replay that cannot bypass the binding |
 
 
 ### Proof classes
@@ -508,9 +540,12 @@ Every proof class the repository standard requires is present and was executed.
 | Integration | `tests/integration` | Durable round trips, replay, revision fencing, usage folding, compaction, retirement, truncation detection. |
 | Adversarial | `tests/adversarial` | Every decoder against every truncation prefix and every single-byte flip; impossible manifests; hostile identifiers and paths. |
 | Property | `tests/property` | More than 300 generated cases per property from a fixed seed and a reported ordinal: canonical encoding is total and injective, digests are declaration-order independent, evaluation is total, deterministic and monotone, tightening a limit never grants more, and replay is exact. |
+| Randomized state machine | `tests/machine` | A long randomized sequence of real service calls against live stores, with the core invariants checked after every step against a reference model. The run is a pure function of its seed, the seed is printed, and a failure reports the step and the steps that led to it, so it is reproducible exactly with `--seed` and `--steps`. |
+| Identity binding | `tests/binding` | The generation and digest binding of a tenant, service or facility identity, checked at evaluation, at determination and at verification, and shown to survive neither a restart nor a replay by accident. |
 | Crash recovery | `tests/recovery` | A real process is killed at each of the four commit-stage boundaries and the store is then reopened. |
 | Cross-process exclusion | `tests/recovery` | A second writer is refused while another process holds the store, a reader is never admitted alongside a writer, and a killed holder does not leave the store locked. |
 | End to end | `examples/consumer` | An installed-package consumer declares, records usage, authorises and reads back. |
+| Command line end to end | `tests/cli` | The built command line tool is run as a child process and its printed answers are asserted, so the option surface, the units and the output shape are validated rather than remembered. |
 | Benchmarks | `bench` | Completed-operation latency and throughput, with provenance labelled per line. |
 
 #### Crash recovery detail
@@ -519,10 +554,31 @@ The interrupted commits are produced by re-executing the recovery suite under a 
 directive, `RESOURCE_ENVELOPE_ABORT_AT`, that terminates the process at a named stage boundary.
 The directive never changes what is written or what is decided; it only ends the process, which is
 what makes the interruption a real process death at a real boundary rather than an approximation.
+It is a test and fault-injection surface and nothing else: it is inert unless it is explicitly set
+in the environment, it is read only at the four commit-stage boundaries of a write, it is never
+consulted on a read or decision path, and its only effect is to end the process with its own
+status. A build that never sets it behaves exactly as a build that does not contain it.
 The suite then asserts that the store either reproduces the last published generation exactly or
 refuses to open, that a subsequent commit succeeds, and that an interrupted publication never
 makes a partial generation visible. The child process is expected to exit with the directive's own
 status, so the suite also proves the interruption happened where it was asked to.
+
+#### Randomized state machine detail
+
+The suite runs three machines. The first drives 200 steps from seed `0x5EED5EED1234ABCD`
+(6 840 227 781 351 353 293), the second 120 steps from seed `0x0F1E2D3C4B5A6978`
+(1 089 357 896 855 742 840), and the third runs 80 steps twice from the second seed over two
+separate stores and asserts that both produce the same state digest, which is what makes a failure
+a fact about the seed rather than about one interleaving. Every random choice comes from that one
+generator, so a reported failure is reproduced exactly:
+
+```sh
+re_test_machine_test_state_machine --seed 6840227781351353293 --steps 200
+```
+
+A failure prints the seed, the step number, the steps that led to it, and the command that
+reproduces it. No step is time-dependent: every timestamp is derived from the step number, so the
+sequence is a pure function of the seed.
 
 #### Cross-process exclusion detail
 
@@ -544,11 +600,11 @@ facility hardware was involved and no before/after or speedup claim is made.
 
 | Operation | Provenance | Iterations | Latency | Throughput |
 | --- | --- | --- | --- | --- |
-| Canonical encode envelope | SYNTHETIC | 200 000 | 408.1 ns/op | 2 450 467 ops/s |
-| Canonical decode envelope | SYNTHETIC | 200 000 | 276.2 ns/op | 3 620 080 ops/s |
-| SHA-256 over canonical bytes | SYNTHETIC | 200 000 | 636.5 ns/op | 1 571 147 ops/s |
-| Evaluate (pure, no store) | SYNTHETIC | 200 000 | 4 513.3 ns/op | 221 568 ops/s |
-| Durable declare (fence + flush + commit) | REAL | 200 | 12 410 801 ns/op | 81 ops/s |
+| Canonical encode envelope | SYNTHETIC | 200 000 | 403.5 ns/op | 2 478 401 ops/s |
+| Canonical decode envelope | SYNTHETIC | 200 000 | 263.9 ns/op | 3 790 032 ops/s |
+| SHA-256 over canonical bytes | SYNTHETIC | 200 000 | 640.5 ns/op | 1 561 221 ops/s |
+| Evaluate (pure, no store) | SYNTHETIC | 200 000 | 4 667.8 ns/op | 214 233 ops/s |
+| Durable declare (fence + flush + commit) | REAL | 200 | 13 207 637 ns/op | 76 ops/s |
 
 The encoded envelope is 202 bytes. The durable figure is dominated by the two flushes and the
 directory publication that the durability guarantee requires. It is reported as measured and is
@@ -644,38 +700,142 @@ and fixed at the root cause.
     measured behaviour of the platform is reported in the cross-process exclusion detail above
     rather than assumed.
 
+The following were found by the randomized state machine and the identity-binding proof added in
+the pass that closed the last two proof gaps. Each is fixed at the root cause and pinned by a
+focused case; the numbers refer to the suite that covers the fix.
+
+15. **A revision refused itself.** `revise` wrote the envelope's own identifier into the
+    `supersedes` pointer. That pointer is a lineage claim about *another* envelope, and evaluation
+    refuses a claim that names the envelope making it, so every envelope that had ever been revised
+    was unevaluable: `revised` envelopes answered `Denied / InvalidArgument` at
+    `LineageIntegrity`. The lifecycle and evaluation suites both revised without evaluating
+    afterwards, which is exactly the interleaving the randomized state machine generated on its
+    first run. `revise` no longer derives a lineage pointer; a caller's own lineage statement is
+    preserved, as on a declaration. (`integration.test_service_store`)
+16. **A compaction changed the state of an empty store.** Compaction forced the journal sequence to
+    one, so a store holding no records committed to a different state after a rewrite than before
+    it, and the manifest it wrote declared a snapshot longer than its committed sequence, so the
+    store it had just published could not be read back at all. A compaction now leaves the sequence
+    exactly as it found it. (`integration.test_service_store`)
+17. **A compaction wrote delta frames into its own snapshot segment.** The manifest counted the
+    frames a snapshot *holds* where it needed the sequence a snapshot *covers*, so after folding
+    several frames into one frame the generation appeared to have a delta. Segment allocation then
+    derived the delta's name from the snapshot's frame count and named the snapshot segment itself,
+    and the next commit appended to it: the manifest named one segment as both its snapshot and its
+    delta, and the store refused it afterwards with "a snapshot segment holds a non-snapshot
+    frame". The delta frame count is now the committed sequence minus the covered sequence, the
+    allocation is always above every generation the manifest names, a generation with no delta is
+    never truncated, and a gap in the journal sequence is detected rather than tolerated.
+    (`integration.test_service_store`, `machine.test_state_machine`)
+18. **An unreferenced segment was appended to.** A process killed inside the very first commit of a
+    new store leaves a segment that no manifest names. The next commit opened it and appended after
+    the unpublished frames, so the frames the manifest counted began at the wrong offset and the
+    store then refused its own state for ever with `StoreIntegrityMismatch`. Unreferenced segments
+    are now removed when a writable store is opened, which is what `remove_orphan_segments`
+    always claimed to do. (`recovery.test_crash_recovery`)
+19. **Committed usage was double counted after a compaction.** A claim accepted by a usage record
+    lived only in the journal, and a snapshot does not carry the journal. A retried record after a
+    compaction was therefore appended a second time and the commitment silently doubled - the one
+    thing the append-only fold exists to prevent. Accepted usage claims are now part of the
+    effective state, beside the aggregate they contributed to, exactly as revision keys are.
+    (`integration.test_service_store`, `machine.test_state_machine`)
+20. **A usage retry became a conflict after a revision.** The claim digest covered the revision the
+    store derived at the time of the attempt, so a lost response followed by a revision turned the
+    retry into `IdempotencyConflict` instead of the replay a retry is. The claim now covers what
+    the caller stated and nothing the store derived, which is the same lesson the declaration path
+    had already learned. (`integration.test_service_store`)
+21. **An observation retry was never a replay.** The claim digest covered the journal sequence and
+    the entry identifier that the store assigns, so it could never match anything a caller could
+    send: a retried observation was recorded again and reported `replayed: 0`. The claim now
+    covers the observation the caller stated. (`integration.test_service_store`)
+22. **Replay resolution ran after retirement instead of before it.** Declarations, revisions, usage
+    records, observations and authorisations resolved a retry *after* the guards that refuse a
+    retired envelope, so a caller retrying a request whose response it never received was refused,
+    or - for an authorisation - had its request evaluated again against an authority that no longer
+    existed. Replay resolution now runs first for every operation, as it already did for
+    retirements. (`integration.test_service_store`, `binding.test_identity_binding`)
+23. **A decision read back carried no digest.** The decision digest is excluded from the record's
+    canonical payload because it is a function of the record, and nothing restored it on decode, so
+    `get_decision`, `list_decisions`, `find_decision_by_key` and the history view reported an
+    absent digest where the determination itself had reported a value. The decoder now restores it.
+    (`integration.test_service_store`)
+24. **A release below zero made its own store unloadable.** The evaluator refuses to interpret a
+    commitment that aggregates below zero, and the snapshot decoder refused to *load* one, so
+    recording a release larger than the commitment - which the API accepts - produced a store that
+    could not be reopened. Persistence now records the value the runtime accepted; the evaluator's
+    refusal to read it as capacity is unchanged. (`integration.test_service_store`)
+25. **Verification ignored the digest it was given.** `verify_authority` compared the identity
+    generation and ignored the identity digest, so a caller reporting that the bound identity record
+    had changed was told the determination was still valid - although a changed digest invalidates a
+    determination exactly as a changed generation does. Both are compared now.
+    (`binding.test_identity_binding`)
+26. **A usage amount was read as a raw nanounit count.** `record-usage --dimension
+    power-draw-watts:30:principal-a` recorded thirty *nanounits*, a hundred-millionth of the 30 W
+    the operator wrote, while a declared limit, a requested quantity and an observed value on the
+    same command line are quantities in the dimension's own unit. Every commitment recorded through
+    the tool was therefore wrong by nine orders of magnitude, and the residual arithmetic computed
+    from it was wrong with it; the documented worked example is what made it visible. A usage
+    amount is now a signed quantity in its dimension's own unit, like every other quantity the tool
+    accepts, and the suite that drives the tool asserts the committed total in nanounits.
+    (`cli.test_cli_end_to_end`)
+27. **`show-revision` could not name a revision.** The command reads `--revision`, and
+    `--revision` was not a recognised option, so the command printed its usage text instead of a
+    retained revision. The option is registered and documented. (`cli.test_cli_end_to_end`)
+28. **An ambiguous scope was reported as an absent one.** When two current envelopes claimed one
+    scope, the resolution failure was discarded and replaced with the generic "no envelope" a
+    context-only evaluation records, so the operator was told to create what already existed and the
+    `DuplicateIdentity` reason was unreachable from the service. The resolution failure is now the
+    reason, and the determination still names no authority and writes no record.
+    (`integration.test_service_store`, `machine.test_state_machine`)
+
 ## Known gaps and unvalidated behaviour
 
 This section is deliberately explicit. None of the following is covered by a passing test, and
 nothing here should be treated as validated.
 
-Every previously recorded gap in this section has been closed and is now covered by a passing
-case. What follows is what remains genuinely unvalidated.
+Both gaps recorded in the previous revision of this section are closed. The confirmed
+identity-binding path is covered directly by `tests/binding` for tenant, service and facility
+scopes - a matching generation and digest is confirmed, a stale generation, a stale digest, a
+foreign identity and an absent confirmation each fail with `GenerationBinding`, and neither a
+restart nor a replay bypasses the binding - and `tests/machine` drives a long randomized sequence
+of interleaved declarations, revisions, retirements, usage records, observations, authorisations,
+verifications, compactions and restarts against live stores, checks ten core invariants after every
+step against a reference model, and reprints the seed and the steps that led to any failure. That
+suite found six defects on its first runs; they are listed above. What follows is what remains
+genuinely unvalidated or deliberately bounded.
 
-1. **`authorize` requires the identity binding to be confirmed or waived.** An envelope that
-   requires binding confirmation refuses evaluation when no identity digest is supplied. This is
-   deliberate and is the correct direction, but a deployment without an identity authority must
-   declare `--require-identity-binding false` explicitly, and no case yet covers the confirmed
-   path: there is no test that supplies a matching identity digest and observes a grant, or a
-   mismatched one and observes `GenerationBinding`.
-2. **No randomized state-machine test.** The property suite validates the pure functions and the
-   replay contract over generated inputs, but it does not drive a long randomized sequence of
-   interleaved declarations, revisions, usage records and retirements against a live store and
-   compare it against a reference model.
-3. **The POSIX implementation is unexecuted.** The file and lock layers have a POSIX branch
-   written against `pwrite`, `pread`, `fsync`, `flock` and `rename`. It has never been compiled or
-   run on any platform, and this repository is validated on Windows only.
-4. **Crash points are stage boundaries, not arbitrary byte boundaries.** The recovery suite kills a
+1. **The POSIX implementation is unexecuted.** The file and lock layers have a POSIX branch written
+   against `pwrite`, `pread`, `fsync`, `flock` and `rename`. It has never been compiled or run on
+   any platform, and this repository is validated on Windows only.
+2. **Crash points are stage boundaries, not arbitrary byte boundaries.** The recovery suite kills a
    process at each of the four commit stages. It does not corrupt a byte inside a frame and then
    assert recovery, because that case is covered by the adversarial decoder sweeps on the frame
    codecs rather than through a live store.
-5. **`RESOURCE_ENVELOPE_ABORT_AT` is a fault-injection surface.** It is documented, it only ever
-   terminates the process, and it is inert unless set. A deployment that considers any such
-   surface unacceptable can compile it out, and the recovery suite would then be unable to produce
-   its interrupted commits.
-6. **Compaction is validated with one generation.** The compaction case declares one envelope,
-   compacts, reads back, reopens and re-reads. It does not exercise compaction over a store holding
-   many generations, retained revisions, decisions, usage entries and retirements at once.
+3. **`RESOURCE_ENVELOPE_ABORT_AT` is a fault-injection surface.** It is documented, it is read only
+   at the four commit-stage boundaries of a write, its only effect is to end the process with its
+   own status, it is never consulted on a read or decision path, and it is inert unless it is
+   explicitly set. A deployment that considers any such surface unacceptable can compile it out,
+   and the recovery suite would then be unable to produce its interrupted commits.
+4. **A composed facility envelope's identity binding is not separately confirmable.** A request
+   carries one identity snapshot, for the scope it addresses. A facility envelope named as a
+   composition source is consulted at its current revision: its dimension constraints are
+   evaluated and it must be current, but its own identity digest is not a second confirmation
+   input, because the request shape has nowhere to carry one. This is a boundary of the request
+   shape rather than an unchecked value - the revision consulted is the one the store holds, and
+   any change to it advances the control epoch and fences every earlier determination - but an
+   operator that needs the facility binding confirmed must address the facility envelope directly.
+   `tests/binding` asserts the boundary rather than leaving it implicit.
+5. **A retired envelope reports no view.** `get_envelope` answers `EnvelopeNotCurrent` for a
+   retired envelope - the identifier is known, so it is distinct from `EnvelopeNotFound`, but the
+   envelope has no current revision - and `list_envelopes` lists current revisions only. The
+   `tombstoned` flag of `EnvelopeView` is therefore never set by either path; a tombstone is read
+   through `history`. This is reported rather than changed, because the two statuses already
+   distinguish "never existed" from "retired" and no consumer of either path relies on a view of a
+   retired envelope.
+6. **Compaction is validated at two generations and beyond, not at a chosen scale.** The compaction
+   cases cover a store holding several generations, retained revisions, decisions, usage entries
+   and a retirement, and the randomized suite compacts repeatedly between mutations, but no case
+   compacts a store holding the maximum permitted number of records.
 ## Unsupported and unvalidated platforms
 
 - **Windows is the only validated platform.** Both configurations were built and tested with

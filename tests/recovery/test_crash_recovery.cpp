@@ -371,8 +371,10 @@ RE_TEST(a_process_killed_at_any_commit_stage_leaves_a_recoverable_store) {
       RE_CHECK_EQ(view.value().record_digest, published_digest);
     } else {
       RE_CHECK_EQ(view.value().envelope.revision, 2ULL);
-      RE_REQUIRE(view.value().envelope.supersedes.has_value());
-      RE_CHECK_EQ(*view.value().envelope.supersedes, std::string("crash-envelope"));
+      // The recovered revision is a revision of the same envelope, identified by its revision
+      // number and lineage. It carries no supersedes pointer, because a pointer naming the
+      // envelope that makes it is a self-reference and is refused at evaluation.
+      RE_CHECK(!view.value().envelope.supersedes.has_value());
     }
     // The recovered state is committed to by the manifest, so the store is usable: a further
     // commit succeeds and is visible after another reopen.
@@ -413,6 +415,46 @@ RE_TEST(an_interrupted_commit_never_publishes_a_partial_generation) {
   const Result<std::vector<EnvelopeView>> all = recovered.value()->list_envelopes();
   RE_REQUIRE(all.ok());
   RE_CHECK_EQ(all.value().size(), std::size_t{1});
+}
+
+RE_TEST(a_crash_during_the_first_commit_leaves_a_store_the_next_commit_can_use) {
+  // The first commit of a new store allocates its segment. A process killed after the frames are
+  // written but before the manifest names them leaves that segment behind with nothing referencing
+  // it. It must never be appended to afterwards: the frames the manifest counts would then start at
+  // the wrong offset, and the store would refuse itself for ever after.
+  const ScratchStore scratch("re-crash-first-commit");
+  // The store directory is created by the child itself, so the interruption happens inside the very
+  // first commit the store ever performs.
+  const ChildProcess child =
+      start_child(quote(executable_path()) + " --child --store " + quote(scratch.path().string()) +
+                      " --envelope first-envelope", "publish");
+  RE_REQUIRE(child.started);
+  RE_CHECK(child.wait());
+  RE_CHECK_EQ(static_cast<long>(child.exit_code()), static_cast<long>(kAbortExitCode));
+
+  {
+    const Result<std::unique_ptr<EnvelopeService>> successor =
+        EnvelopeService::open(scratch.path(), existing_options());
+    RE_REQUIRE(successor.ok());
+    const DeclareInput input =
+        declaration_for("successor-envelope", 100ULL, "declare-1", 1767225600000000000LL);
+    RE_REQUIRE(successor.value()->declare(input).ok());
+    // The unpublished declaration is not authority: the store holds the successor and nothing else.
+    const Result<std::vector<EnvelopeView>> listed = successor.value()->list_envelopes();
+    RE_REQUIRE(listed.ok());
+    RE_CHECK_EQ(listed.value().size(), std::size_t{1});
+    RE_CHECK_EQ(listed.value().front().envelope.id, std::string("successor-envelope"));
+    const Result<EnvelopeView> unpublished = successor.value()->get_envelope("first-envelope");
+    RE_CHECK(!unpublished.ok());
+  }
+  // The store the successor produced is a store: it reopens, with the state it committed to.
+  const Result<std::unique_ptr<EnvelopeService>> reopened =
+      EnvelopeService::open(scratch.path(), existing_options());
+  RE_REQUIRE(reopened.ok());
+  const Result<std::vector<EnvelopeView>> listed = reopened.value()->list_envelopes();
+  RE_REQUIRE(listed.ok());
+  RE_CHECK_EQ(listed.value().size(), std::size_t{1});
+  RE_CHECK_EQ(listed.value().front().envelope.id, std::string("successor-envelope"));
 }
 
 int main(int argc, char** argv) {

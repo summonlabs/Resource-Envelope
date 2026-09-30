@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -28,8 +29,16 @@ namespace resource_envelope {
 // ---------------------------------------------------------------------------
 // Every bound below is enforced before an allocation or a write, so a hostile or
 // corrupt input can never cause unbounded work.
+// The frame and segment wire format: the segment header, the frame header and the payload of a
+// journal entry are read exactly as they were written since the first release. A change to the
+// manifest or to the canonical state layout is versioned separately, by kStoreLayoutVersion.
 inline constexpr std::uint32_t kStoreFormatVersion = 1;
-inline constexpr std::uint32_t kStoreLayoutVersion = 1;
+// The layout of the manifest and of the canonical state body. Layout 2 records the journal
+// sequence a snapshot covers, so the delta frame count of a compacted generation is exact,
+// and carries the accepted usage claims, so an idempotent usage retry is recognised after a
+// compaction. A store written under an earlier layout is refused with UnsupportedVersion
+// rather than misinterpreted, because the two layouts are not distinguishable by inspection.
+inline constexpr std::uint32_t kStoreLayoutVersion = 2;
 inline constexpr std::uint64_t kMaxFramePayloadBytes = 64ULL * 1024ULL * 1024ULL;
 inline constexpr std::uint64_t kMaxSegmentBytes = 4ULL * 1024ULL * 1024ULL * 1024ULL;
 inline constexpr std::uint64_t kMaxTotalStoreBytes = 16ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -87,7 +96,13 @@ struct RESOURCE_ENVELOPE_API Manifest {
   std::uint64_t delta_segment = 0;
   std::uint64_t frames_committed = 0;
   std::uint64_t state_sequence = 0;
+  // Physical frames in the snapshot segment (zero when the generation has no snapshot).
   std::uint64_t snapshot_frames = 0;
+  // Highest journal sequence the named snapshot covers. The committed delta frames are
+  // exactly the sequences above it, which is what makes the delta frame count exact after a
+  // compaction folded an arbitrary number of frames into a single snapshot frame. It is
+  // zero exactly when the generation has no snapshot.
+  std::uint64_t snapshot_sequence = 0;
   Digest state_digest;
   Digest chain_digest;
   std::uint64_t envelope_count = 0;
@@ -217,6 +232,35 @@ struct RESOURCE_ENVELOPE_API CommittedValue {
 
 using CommittedMap = std::map<CommittedKey, CommittedValue>;
 
+// One accepted usage claim. Committed usage is a fold over deltas, so the aggregate alone
+// cannot distinguish a retry from a second, identical claim: the claim that was accepted is
+// therefore recorded beside the aggregate, exactly as the revision keys are recorded beside
+// the revisions. The digest is the identity of the claim as the *caller* stated it (see
+// usage_claim_digest), so a retry is recognised as the same claim even after the authority
+// has moved, and the revision is the one the claim was recorded against, which is what a
+// replay reports. Claims are part of the effective state and survive compaction.
+struct RESOURCE_ENVELOPE_API UsageClaim {
+  std::string envelope_id;
+  std::string idempotency_key;
+  Digest claim_digest;
+  std::uint64_t envelope_revision = 0;
+
+  [[nodiscard]] friend bool operator<(const UsageClaim& left, const UsageClaim& right) noexcept {
+    if (left.envelope_id != right.envelope_id) return left.envelope_id < right.envelope_id;
+    if (left.idempotency_key != right.idempotency_key) {
+      return left.idempotency_key < right.idempotency_key;
+    }
+    return left.claim_digest < right.claim_digest;
+  }
+  [[nodiscard]] friend bool operator==(const UsageClaim& left, const UsageClaim& right) noexcept {
+    return left.envelope_id == right.envelope_id &&
+           left.idempotency_key == right.idempotency_key &&
+           left.claim_digest == right.claim_digest;
+  }
+};
+
+using UsageClaimSet = std::set<UsageClaim>;
+
 // The effective state. The journal is part of it so that idempotent replay and audit
 // history stay answerable after a restart; the journal is excluded from the state
 // digest, which covers effective values only. An idempotent replay that appends
@@ -227,6 +271,10 @@ struct RESOURCE_ENVELOPE_API StoreState {
   std::vector<DecisionRecord> decisions;
   std::map<std::string, ObservationEntry> observations;
   CommittedMap committed;
+  // Accepted usage claims, in canonical order. The journal is not part of a snapshot, so a
+  // claim that lived only in the journal would be forgotten by a compaction and the same
+  // delta would be counted twice on retry.
+  UsageClaimSet usage_claims;
   std::vector<JournalEntry> journal;
   // Committed retirements, in sequence order. A snapshot does not carry the journal, so
   // retirements are kept explicitly: without them a restarted process would treat a
