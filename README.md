@@ -1,6 +1,6 @@
 # Resource Envelope
 
-Facility-level resource-envelope runtime for DCCP Tranche 6 (repository 42 of 72).
+Facility-level resource-envelope runtime.
 
 ## What this runtime is
 
