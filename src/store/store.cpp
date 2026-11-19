@@ -871,6 +871,10 @@ class Store::Impl {
   std::uint64_t total_bytes_ = 0;
   std::uint64_t delta_epoch_ = 0;
   bool delta_open_ = false;
+  // Set when the frames of a commit that failed could not be removed from the delta segment.
+  // Nothing may be appended after them, so the handle refuses to commit until it is reopened
+  // (an open removes an unpublished tail).
+  bool delta_tail_unpublished_ = false;
 };
 
 Status Store::Impl::ensure_layout() {
@@ -1534,6 +1538,11 @@ Status Store::Impl::write_transaction(const std::function<Status(JournalSession&
     return Status(StatusCode::UnsupportedOperation,
                   "a read-only store handle cannot be written through");
   }
+  if (delta_tail_unpublished_) {
+    return Status(StatusCode::StoreIoError,
+                  "the frames of a commit that failed could not be removed from the delta segment; "
+                  "reopen the store");
+  }
   if (!lock_.held()) {
     const Status status = acquire(internal::LockMode::Exclusive);
     if (!status.ok()) return status;
@@ -1587,7 +1596,10 @@ Status Store::Impl::write_transaction(const std::function<Status(JournalSession&
     delta_file_ = internal::FileHandle();
     const std::filesystem::path path = segments_path() / segment_file_name(delta_epoch);
     std::error_code error;
-    const bool exists = std::filesystem::exists(path, error) && !error;
+    // Only a delta segment the manifest names is appended to. When this commit allocates the
+    // segment, a file already carrying its epoch is the residue of a compaction or a commit that
+    // failed before it published (it used the same epoch); it is replaced, never appended to.
+    const bool exists = manifest_.delta_segment != 0U && std::filesystem::exists(path, error) && !error;
     if (exists) {
       Result<internal::FileHandle> handle = internal::FileHandle::open_write_append(path);
       if (!handle.ok()) return handle.status();
@@ -1607,82 +1619,102 @@ Status Store::Impl::write_transaction(const std::function<Status(JournalSession&
     delta_open_ = true;
   }
 
-  struct PendingFrame {
-    std::uint64_t offset = 0U;
-    Digest digest;
-    std::uint32_t length = 0U;
+  // From here to the publication of the manifest the commit writes frames that no manifest
+  // names yet. When a step fails they are removed again, so that the next commit appends
+  // directly after the last published frame: the manifest counts frames from the start of the
+  // segment, and frames left behind by a commit that failed would be read in place of the
+  // frames of the commits that followed it.
+  const std::uint64_t delta_published_bytes = delta_file_.size();
+  const auto write_and_publish = [&]() -> Status {
+    struct PendingFrame {
+      std::uint64_t offset = 0U;
+      Digest digest;
+      std::uint32_t length = 0U;
+    };
+    std::vector<PendingFrame> pending;
+    pending.reserve(session.appended().size());
+    for (const JournalEntry& entry : session.appended()) {
+      const Bytes payload = canonical_journal_entry(entry);
+      if (payload.size() > kMaxFramePayloadBytes) {
+        return Status(StatusCode::StoreLimitExceeded, "the record exceeds the maximum frame payload");
+      }
+      const Digest payload_digest =
+          Digest(sha256_domain(kDomainFrame, std::span<const std::uint8_t>(payload.data(), payload.size())));
+      const std::array<std::uint8_t, kFrameHeaderBytes> header =
+          encode_frame_header(static_cast<std::uint16_t>(entry.kind),
+                              static_cast<std::uint32_t>(payload.size()), crc32_ieee(payload), new_epoch,
+                              entry.sequence, payload_digest);
+      PendingFrame record;
+      record.offset = delta_file_.size();
+      record.length = static_cast<std::uint32_t>(payload.size());
+      record.digest = payload_digest;
+      status = delta_file_.write_at(record.offset, header);
+      if (!status.ok()) return status;
+      status = delta_file_.write_at(record.offset + kFrameHeaderBytes, payload);
+      if (!status.ok()) return status;
+      pending.push_back(record);
+    }
+
+    // Stage three: flush the segment and read every frame back through the same handle,
+    // verifying the bytes that were actually written.
+    terminate_at_commit_stage("frames");
+    status = delta_file_.flush();
+    if (!status.ok()) return status;
+    for (const PendingFrame& record : pending) {
+      std::vector<std::uint8_t> header;
+      status = delta_file_.read_at(record.offset, kFrameHeaderBytes, header);
+      if (!status.ok()) return status;
+      if (!magic_matches(header, kFrameMagic) || get_u32(header, 16U) != record.length) {
+        return Status(StatusCode::StoreUnverified, "a frame header did not read back as written");
+      }
+      std::vector<std::uint8_t> payload;
+      status = delta_file_.read_at(record.offset + kFrameHeaderBytes, record.length, payload);
+      if (!status.ok()) return status;
+      if (crc32_ieee(payload) != get_u32(header, 20U)) {
+        return Status(StatusCode::StoreUnverified, "a frame checksum did not read back as written");
+      }
+      Digest::Value stored{};
+      for (std::size_t index = 0; index < stored.size(); ++index) stored[index] = header[40U + index];
+      const Digest computed(
+          sha256_domain(kDomainFrame, std::span<const std::uint8_t>(payload.data(), payload.size())));
+      if (computed != record.digest || stored != record.digest.value()) {
+        return Status(StatusCode::StoreUnverified, "a frame digest did not read back as written");
+      }
+    }
+
+    // Stage four: publish the manifest. This replacement is the commit point.
+    terminate_at_commit_stage("verify");
+    Manifest next = manifest_;
+    next.epoch = new_epoch;
+    next.state_epoch = new_epoch;
+    next.state_sequence = state.state_sequence;
+    next.delta_segment = delta_epoch;
+    terminate_at_commit_stage("publish");
+    next.frames_committed = state.state_sequence;
+    next.envelope_count = state.envelopes.size();
+    next.revision_count = state.revision_count;
+    next.decision_count = state.decisions.size();
+    next.usage_entry_count = state.usage_entry_count;
+    next.observation_count = state.observations.size();
+    next.compaction_count = state.compaction_count;
+    next.state_digest = store_state_digest(state);
+    next.chain_digest = manifest_digest(next);
+    status = publish_manifest(next);
+    if (!status.ok()) return status;
+    manifest_ = next;
+    return Status{};
   };
-  std::vector<PendingFrame> pending;
-  pending.reserve(session.appended().size());
-  for (const JournalEntry& entry : session.appended()) {
-    const Bytes payload = canonical_journal_entry(entry);
-    if (payload.size() > kMaxFramePayloadBytes) {
-      return Status(StatusCode::StoreLimitExceeded, "the record exceeds the maximum frame payload");
+  status = write_and_publish();
+  if (!status.ok()) {
+    Status removed = delta_file_.truncate(delta_published_bytes);
+    if (removed.ok()) removed = delta_file_.flush();
+    if (!removed.ok()) {
+      delta_file_ = internal::FileHandle();
+      delta_open_ = false;
+      delta_tail_unpublished_ = true;
     }
-    const Digest payload_digest =
-        Digest(sha256_domain(kDomainFrame, std::span<const std::uint8_t>(payload.data(), payload.size())));
-    const std::array<std::uint8_t, kFrameHeaderBytes> header =
-        encode_frame_header(static_cast<std::uint16_t>(entry.kind),
-                            static_cast<std::uint32_t>(payload.size()), crc32_ieee(payload), new_epoch,
-                            entry.sequence, payload_digest);
-    PendingFrame record;
-    record.offset = delta_file_.size();
-    record.length = static_cast<std::uint32_t>(payload.size());
-    record.digest = payload_digest;
-    status = delta_file_.write_at(record.offset, header);
-    if (!status.ok()) return status;
-    status = delta_file_.write_at(record.offset + kFrameHeaderBytes, payload);
-    if (!status.ok()) return status;
-    pending.push_back(record);
+    return status;
   }
-
-  // Stage three: flush the segment and read every frame back through the same handle,
-  // verifying the bytes that were actually written.
-  terminate_at_commit_stage("frames");
-  status = delta_file_.flush();
-  if (!status.ok()) return status;
-  for (const PendingFrame& record : pending) {
-    std::vector<std::uint8_t> header;
-    status = delta_file_.read_at(record.offset, kFrameHeaderBytes, header);
-    if (!status.ok()) return status;
-    if (!magic_matches(header, kFrameMagic) || get_u32(header, 16U) != record.length) {
-      return Status(StatusCode::StoreUnverified, "a frame header did not read back as written");
-    }
-    std::vector<std::uint8_t> payload;
-    status = delta_file_.read_at(record.offset + kFrameHeaderBytes, record.length, payload);
-    if (!status.ok()) return status;
-    if (crc32_ieee(payload) != get_u32(header, 20U)) {
-      return Status(StatusCode::StoreUnverified, "a frame checksum did not read back as written");
-    }
-    Digest::Value stored{};
-    for (std::size_t index = 0; index < stored.size(); ++index) stored[index] = header[40U + index];
-    const Digest computed(
-        sha256_domain(kDomainFrame, std::span<const std::uint8_t>(payload.data(), payload.size())));
-    if (computed != record.digest || stored != record.digest.value()) {
-      return Status(StatusCode::StoreUnverified, "a frame digest did not read back as written");
-    }
-  }
-
-  // Stage four: publish the manifest. This replacement is the commit point.
-  terminate_at_commit_stage("verify");
-  Manifest next = manifest_;
-  next.epoch = new_epoch;
-  next.state_epoch = new_epoch;
-  next.state_sequence = state.state_sequence;
-  next.delta_segment = delta_epoch;
-  terminate_at_commit_stage("publish");
-  next.frames_committed = state.state_sequence;
-  next.envelope_count = state.envelopes.size();
-  next.revision_count = state.revision_count;
-  next.decision_count = state.decisions.size();
-  next.usage_entry_count = state.usage_entry_count;
-  next.observation_count = state.observations.size();
-  next.compaction_count = state.compaction_count;
-  next.state_digest = store_state_digest(state);
-  next.chain_digest = manifest_digest(next);
-  status = publish_manifest(next);
-  if (!status.ok()) return status;
-  manifest_ = next;
   return refresh_total_bytes();
 }
 
@@ -1756,7 +1788,13 @@ Status Store::Impl::compact() {
   next.state_digest = store_state_digest(state);
   next.chain_digest = manifest_digest(next);
   status = publish_manifest(next);
-  if (!status.ok()) return status;
+  if (!status.ok()) {
+    // The snapshot segment was written and no manifest names it. It is removed, so that
+    // nothing is left under an epoch the next commit or compaction allocates again.
+    bool removed = false;
+    (void)remove_file_if_present(segments_path() / segment_file_name(new_epoch), removed);
+    return status;
+  }
   const std::uint64_t previous_snapshot = manifest_.snapshot_segment;
   const std::uint64_t previous_delta = manifest_.delta_segment;
   manifest_ = next;

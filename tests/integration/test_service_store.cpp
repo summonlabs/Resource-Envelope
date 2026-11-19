@@ -2,9 +2,11 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <system_error>
+#include <thread>
 
 #include "resource_envelope/service.hpp"
 
@@ -364,6 +366,129 @@ RE_TEST(compaction_preserves_state_and_digest) {
   RE_CHECK_EQ(reopened_stats.value().compaction_count, 1ULL);
   RE_CHECK_EQ(reopened_stats.value().envelope_count, envelope_count);
   RE_CHECK_EQ(reopened_stats.value().state_sequence, state_sequence);
+}
+
+namespace {
+
+DeclareInput declare_input_for(const std::string& identity, const std::string& key) {
+  DeclareInput input;
+  input.envelope = envelope_for(identity, 3U, 100ULL);
+  input.idempotency_key = key;
+  input.requested_at = 1767225600000000000LL;
+  return input;
+}
+
+}  // namespace
+
+RE_TEST(a_commit_waits_for_a_reader_of_the_manifest) {
+  const ScratchStore scratch("re-store-manifest-reader");
+  {
+    const Result<std::unique_ptr<EnvelopeService>> service =
+        EnvelopeService::open(scratch.path(), create_options());
+    RE_REQUIRE(service.ok());
+    RE_REQUIRE(service.value()->declare(declare_input_for("tenant-a", "declare-a")).ok());
+
+    // A reader has the manifest open for a moment (an inspection, a backup, a scan) while the
+    // next commit replaces it.
+    std::ifstream reader(scratch.path() / "manifest.renv", std::ios::binary);
+    const bool reader_open = static_cast<bool>(reader);
+    std::thread release([&reader] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+      reader.close();
+    });
+    const Result<EnvelopeDeclaration> declared =
+        service.value()->declare(declare_input_for("tenant-b", "declare-b"));
+    release.join();
+    RE_CHECK(reader_open);
+    RE_CHECK(declared.ok());
+    const Result<StoreStatistics> stats = service.value()->statistics();
+    RE_REQUIRE(stats.ok());
+    RE_CHECK_EQ(stats.value().envelope_count, 2ULL);
+  }
+  const Result<std::unique_ptr<EnvelopeService>> reopened =
+      EnvelopeService::open(scratch.path(), existing_options(OpenMode::OpenExisting));
+  RE_REQUIRE(reopened.ok());
+  const Result<StoreStatistics> after = reopened.value()->statistics();
+  RE_REQUIRE(after.ok());
+  RE_CHECK_EQ(after.value().envelope_count, 2ULL);
+}
+
+RE_TEST(a_commit_that_could_not_publish_leaves_nothing_for_the_next_commit_to_build_on) {
+  const ScratchStore scratch("re-store-unpublished-commit");
+  Digest digest_before;
+  std::uint64_t envelopes_before = 0U;
+  {
+    const Result<std::unique_ptr<EnvelopeService>> service =
+        EnvelopeService::open(scratch.path(), create_options());
+    RE_REQUIRE(service.ok());
+    RE_REQUIRE(service.value()->declare(declare_input_for("tenant-a", "declare-a")).ok());
+    {
+      // The reader keeps the manifest open for the whole commit: the frames of the commit are
+      // written to the delta segment, and the manifest that would name them cannot be published.
+      std::ifstream reader(scratch.path() / "manifest.renv", std::ios::binary);
+      RE_CHECK(static_cast<bool>(reader));
+      const Result<EnvelopeDeclaration> refused =
+          service.value()->declare(declare_input_for("tenant-b", "declare-b"));
+#ifdef _WIN32
+      RE_CHECK(!refused.ok());
+#else
+      RE_CHECK(refused.ok());
+#endif
+    }
+    // The next commit is published. The frames of the commit that failed are not in its way.
+    RE_REQUIRE(service.value()->declare(declare_input_for("tenant-c", "declare-c")).ok());
+    const Result<StoreStatistics> stats = service.value()->statistics();
+    RE_REQUIRE(stats.ok());
+    digest_before = stats.value().state_digest;
+    envelopes_before = stats.value().envelope_count;
+#ifdef _WIN32
+    RE_CHECK_EQ(envelopes_before, 2ULL);
+#endif
+  }
+  // The store reopens with exactly the state the last manifest describes.
+  const Result<std::unique_ptr<EnvelopeService>> reopened =
+      EnvelopeService::open(scratch.path(), existing_options(OpenMode::OpenExisting));
+  RE_REQUIRE(reopened.ok());
+  const Result<StoreStatistics> after = reopened.value()->statistics();
+  RE_REQUIRE(after.ok());
+  RE_CHECK(after.value().state_digest == digest_before);
+  RE_CHECK_EQ(after.value().envelope_count, envelopes_before);
+}
+
+RE_TEST(a_compaction_that_could_not_publish_does_not_spoil_the_next_commit) {
+  const ScratchStore scratch("re-store-unpublished-compaction");
+  Digest digest_before;
+  {
+    const Result<std::unique_ptr<EnvelopeService>> service =
+        EnvelopeService::open(scratch.path(), create_options());
+    RE_REQUIRE(service.ok());
+    RE_REQUIRE(service.value()->declare(declare_input_for("tenant-a", "declare-a")).ok());
+    // After a compaction the store has no delta segment: the next commit allocates one.
+    RE_REQUIRE(service.value()->compact().ok());
+    {
+      // A second compaction writes its snapshot segment and cannot publish the manifest.
+      std::ifstream reader(scratch.path() / "manifest.renv", std::ios::binary);
+      RE_CHECK(static_cast<bool>(reader));
+      const Status refused = service.value()->compact();
+#ifdef _WIN32
+      RE_CHECK(!refused.ok());
+#else
+      RE_CHECK(refused.ok());
+#endif
+    }
+    RE_REQUIRE(service.value()->declare(declare_input_for("tenant-b", "declare-b")).ok());
+    const Result<StoreStatistics> stats = service.value()->statistics();
+    RE_REQUIRE(stats.ok());
+    RE_CHECK_EQ(stats.value().envelope_count, 2ULL);
+    digest_before = stats.value().state_digest;
+  }
+  const Result<std::unique_ptr<EnvelopeService>> reopened =
+      EnvelopeService::open(scratch.path(), existing_options(OpenMode::OpenExisting));
+  RE_REQUIRE(reopened.ok());
+  const Result<StoreStatistics> after = reopened.value()->statistics();
+  RE_REQUIRE(after.ok());
+  RE_CHECK(after.value().state_digest == digest_before);
+  RE_CHECK_EQ(after.value().envelope_count, 2ULL);
 }
 
 RE_TEST(retirement_stops_an_envelope_being_authoritative) {

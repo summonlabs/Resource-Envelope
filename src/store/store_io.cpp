@@ -158,17 +158,33 @@ Status flush_directory(const std::filesystem::path& directory) {
 }
 
 Status replace_file(const std::filesystem::path& source, const std::filesystem::path& destination) {
-  if (::ReplaceFileW(destination.c_str(), source.c_str(), nullptr, REPLACEFILE_WRITE_THROUGH, nullptr,
-                     nullptr) != 0) {
-    return Status{};
+  // While a reader has the destination open (an inspection, a backup, an antivirus or
+  // indexing scan) the replacement fails until the reader closes it, so it is retried for a
+  // bounded time (about 2 s). A directory or a read-only file in the way is not transient and
+  // fails at once.
+  for (int attempt = 0;; ++attempt) {
+    if (::ReplaceFileW(destination.c_str(), source.c_str(), nullptr, REPLACEFILE_WRITE_THROUGH, nullptr,
+                       nullptr) != 0) {
+      return Status{};
+    }
+    // ReplaceFile requires the destination to exist. A first publication, or a store
+    // whose manifest an operator removed, falls back to MoveFileEx, which is itself an
+    // atomic replacement within one volume.
+    if (::MoveFileExW(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) {
+      return Status{};
+    }
+    const DWORD error = ::GetLastError();
+    const DWORD attributes = ::GetFileAttributesW(destination.c_str());
+    const bool blocked = attributes != INVALID_FILE_ATTRIBUTES &&
+                         (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY)) != 0;
+    const bool transient =
+        (error == ERROR_ACCESS_DENIED || error == ERROR_SHARING_VIOLATION || error == ERROR_LOCK_VIOLATION) &&
+        !blocked;
+    if (!transient || attempt >= 100) {
+      return Status(StatusCode::StoreIoError, "publishing the file could not be completed atomically");
+    }
+    ::Sleep(20);
   }
-  // ReplaceFile requires the destination to exist. A first publication, or a store
-  // whose manifest an operator removed, falls back to MoveFileEx, which is itself an
-  // atomic replacement within one volume.
-  if (::MoveFileExW(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) {
-    return Status{};
-  }
-  return Status(StatusCode::StoreIoError, "publishing the file could not be completed atomically");
 }
 
 #else  // POSIX

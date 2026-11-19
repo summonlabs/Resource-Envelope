@@ -35,6 +35,7 @@ include(CMakePushCheckState)
 
 set(RESOURCE_ENVELOPE_HARDENING_FLAGS "")
 set(RESOURCE_ENVELOPE_SANITIZER_FLAGS "")
+set(RESOURCE_ENVELOPE_SANITIZER_LINK_FLAGS "")
 set(RESOURCE_ENVELOPE_HAS_ADDRESS_SANITIZER FALSE)
 
 function(re_probe_flag out_var flag)
@@ -56,9 +57,19 @@ endfunction()
 
 if(RESOURCE_ENVELOPE_ENABLE_SANITIZERS)
   if(MSVC)
-    re_probe_flag(RE_MSVC_ASAN_SUPPORTED "/fsanitize=address")
+    # The sanitizer is a compile option. Sanitizer objects need debug
+    # information (C5072 and LNK4302 without /Zi and /DEBUG) and cannot be
+    # linked incrementally (LNK4300), so the probe and the build both use /Zi
+    # and link with /INCREMENTAL:NO /DEBUG.
+    cmake_push_check_state(RESET)
+    set(CMAKE_REQUIRED_QUIET TRUE)
+    set(CMAKE_REQUIRED_FLAGS "/fsanitize=address /Zi")
+    set(CMAKE_REQUIRED_LINK_OPTIONS "/INCREMENTAL:NO;/DEBUG")
+    check_cxx_source_compiles("int main() { return 0; }" RE_MSVC_ASAN_SUPPORTED)
+    cmake_pop_check_state()
     if(RE_MSVC_ASAN_SUPPORTED)
-      set(RESOURCE_ENVELOPE_SANITIZER_FLAGS "/fsanitize=address")
+      set(RESOURCE_ENVELOPE_SANITIZER_FLAGS /fsanitize=address /Zi)
+      set(RESOURCE_ENVELOPE_SANITIZER_LINK_FLAGS /INCREMENTAL:NO /DEBUG)
       set(RESOURCE_ENVELOPE_HAS_ADDRESS_SANITIZER TRUE)
     endif()
   else()
@@ -125,6 +136,9 @@ endif()
 function(resource_envelope_apply_warnings target)
   target_compile_options(${target} PRIVATE
     ${RE_WARN_FLAGS} ${RESOURCE_ENVELOPE_HARDENING_FLAGS} ${RESOURCE_ENVELOPE_SANITIZER_FLAGS})
+  if(RESOURCE_ENVELOPE_SANITIZER_LINK_FLAGS)
+    target_link_options(${target} PRIVATE ${RESOURCE_ENVELOPE_SANITIZER_LINK_FLAGS})
+  endif()
   target_compile_definitions(${target} PRIVATE ${RE_WARN_DEFINITIONS})
   target_compile_features(${target} PRIVATE cxx_std_20)
   set_target_properties(${target} PROPERTIES CXX_EXTENSIONS OFF)

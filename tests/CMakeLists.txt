@@ -8,11 +8,14 @@ add_library(resource_envelope_testkit STATIC support/main.cpp)
 target_include_directories(resource_envelope_testkit PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(resource_envelope_testkit PUBLIC resource_envelope)
 resource_envelope_apply_warnings(resource_envelope_testkit)
-if(MSVC AND NOT CMAKE_BUILD_TYPE STREQUAL "Release")
-  # Iterator debugging and runtime checks stay on in every non-Release build, so the Debug
-  # validation is genuinely stronger than the Release validation. Release cannot carry
-  # _ITERATOR_DEBUG_LEVEL=2: the Standard Library refuses that combination.
-  target_compile_definitions(resource_envelope_testkit PUBLIC _ITERATOR_DEBUG_LEVEL=2)
+if(MSVC)
+  # Iterator debugging stays on in the Debug build, so the Debug validation is genuinely
+  # stronger than the Release validation. Only the debug runtime supports
+  # _ITERATOR_DEBUG_LEVEL=2: Release, RelWithDebInfo and MinSizeRel use the release runtime,
+  # where the Standard Library refuses that combination (C1189). The configuration is
+  # selected per build, so a multi-configuration generator gets it right as well.
+  target_compile_definitions(resource_envelope_testkit PUBLIC
+    $<$<CONFIG:Debug>:_ITERATOR_DEBUG_LEVEL=2>)
 endif()
 
 set(RESOURCE_ENVELOPE_TEST_SOURCES

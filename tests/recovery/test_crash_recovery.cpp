@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <system_error>
@@ -137,8 +138,20 @@ ChildProcess start_child(const std::string& arguments, const std::string& abort_
   const std::string command_line = quote(interpreter) + " /d /s /c " + quote(arguments);
   std::string environment;
   if (!abort_stage.empty()) {
-    // The block must end with a second terminator, so the variable is terminated twice.
-    environment = std::string("RESOURCE_ENVELOPE_ABORT_AT=") + abort_stage + std::string("\0\0", 2U);
+    // The child gets this process's environment plus the directive. A block that held the
+    // directive alone would start the child without PATH and SystemRoot, and a child that cannot
+    // find a runtime library it was built against (a sanitizer build needs the sanitizer runtime)
+    // does not run: the system raises a dialog and waits for someone to dismiss it.
+    if (char* const inherited = ::GetEnvironmentStringsA(); inherited != nullptr) {
+      for (const char* cursor = inherited; *cursor != '\0';) {
+        const std::size_t length = std::strlen(cursor);
+        environment.append(cursor, length + 1U);
+        cursor += length + 1U;
+      }
+      ::FreeEnvironmentStringsA(inherited);
+    }
+    // The block ends with a second terminator after its last variable.
+    environment += std::string("RESOURCE_ENVELOPE_ABORT_AT=") + abort_stage + std::string("\0\0", 2U);
   }
   STARTUPINFOA startup{};
   startup.cb = sizeof(startup);
